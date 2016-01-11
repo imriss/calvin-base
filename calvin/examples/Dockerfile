@@ -6,4 +6,3 @@ RUN git clone -b develop https://github.com/EricssonResearch/calvin-base calvin-
 RUN cd calvin-base && pip install -e .
 RUN apk del git gcc python-dev musl-dev && rm -rf /var/cache/apk/*
 ENTRYPOINT ["/bin/sh"]
-
