@@ -1,11 +1,8 @@
 FROM alpine:3.2
 RUN apk --update add python py-pip openssl ca-certificates && pip install -U setuptools
-RUN apk --update add --virtual build-dependencies git gcc python-dev musl-dev build-base wget \
-        && git clone -b Release-0.1.0 https://github.com/EricssonResearch/calvin-base calvin01 \
-        && cd calvin01 && python setup.py install && cd .. \
-        && git clone https://github.com/EricssonResearch/calvin-base calvin \
-        && cd calvin && python setup.py install && cd .. \
-        && csruntime --host localhost calvin01/calvin/tests/scripts/test1.calvin \
+RUN apk --update add --virtual build-dependencies build-base git gcc python-dev musl-dev wget \
+        && git clone -b develop https://github.com/EricssonResearch/calvin-base calvin-base \
+        && cd calvin-base && pip install -e . && cd .. \
         && apk del build-dependencies \
         && rm -rf /var/cache/apk/*
-ENTRYPOINT ["python"]
+ENTRYPOINT ["csruntime", "--host", "$(awk 'NR==1 { print $1 }' /etc/hosts)"]
