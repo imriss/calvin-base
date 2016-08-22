@@ -1,3 +1,19 @@
+# -*- coding: utf-8 -*-
+
+# Copyright (c) 2015 Ericsson AB
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from calvin.actor.actor import Actor, ActionResult, condition, manage
 
 
@@ -18,6 +34,7 @@ class ImageRenderer(Actor):
 
     def setup(self):
         self.use("calvinsys.media.image", shorthand="image")
+        self.use('calvinsys.native.python-base64', shorthand="base64")
         self.image = self["image"]
 
     def did_migrate(self):
@@ -31,9 +48,9 @@ class ImageRenderer(Actor):
 
     @condition(action_input=('image',))
     def render_image(self, image):
-        if not image is None:
-            self.image.show_image(image, self.width, self.height)
+        if image is not None:
+            self.image.show_image(self['base64'].b64decode(image), self.width, self.height)
         return ActionResult(production=())
 
     action_priority = (render_image, )
-    requires =  ['calvinsys.media.image']
+    requires =  ['calvinsys.media.image', 'calvinsys.native.python-base64']

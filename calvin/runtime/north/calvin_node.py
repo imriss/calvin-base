@@ -27,6 +27,9 @@ from calvin.runtime.north import appmanager
 from calvin.runtime.north import scheduler
 from calvin.runtime.north import storage
 from calvin.runtime.north import calvincontrol
+from calvin.runtime.north import metering
+from calvin.runtime.north.authentication import authentication
+from calvin.runtime.north.authorization import authorization
 from calvin.runtime.north.calvin_network import CalvinNetwork
 from calvin.runtime.north.calvin_proto import CalvinProto
 from calvin.runtime.north.portmanager import PortManager
@@ -34,9 +37,14 @@ from calvin.runtime.south.monitor import Event_Monitor
 from calvin.runtime.south.plugins.async import async
 from calvin.utilities.attribute_resolver import AttributeResolver
 from calvin.utilities.calvin_callback import CalvinCB
+from calvin.utilities.security import security_modules_check
 from calvin.utilities import calvinuuid
+from calvin.utilities import certificate
 from calvin.utilities.calvinlogger import get_logger
+from calvin.utilities import calvinconfig
+
 _log = get_logger(__name__)
+_conf = calvinconfig.get()
 
 
 def addr_from_uri(uri):
@@ -48,7 +56,7 @@ def addr_from_uri(uri):
 class Node(object):
 
     """A node of calvin
-       the uri is used as server connection point
+       the uri is a list of server connection points
        the control_uri is the local console
        attributes is a supplied list of external defined attributes that will be used as the key when storing index
        such as name of node
@@ -58,18 +66,34 @@ class Node(object):
         super(Node, self).__init__()
         self.uri = uri
         self.control_uri = control_uri
+        self.external_uri = attributes.pop('external_uri', self.uri) \
+            if attributes else self.uri
+        self.external_control_uri = attributes.pop('external_control_uri', self.control_uri) \
+            if attributes else self.control_uri
         try:
             self.attributes = AttributeResolver(attributes)
         except:
             _log.exception("Attributes not correct, uses empty attribute!")
             self.attributes = AttributeResolver(None)
-        self.id = calvinuuid.uuid("NODE")
+        self.node_name = self.attributes.get_node_name_as_str()
+        # Obtain node id, when using security also handle runtime certificate
+        self.id = certificate.obtain_cert_node_info(self.node_name)['id']
+        self.authentication = authentication.Authentication(self)
+        self.authorization = authorization.Authorization(self)
+        try:
+            self.domain = _conf.get("security", "security_domain_name")
+            # cert_name is the node's certificate filename (without file extension)
+            self.cert_name = certificate.get_own_cert_name(self.node_name)
+        except:
+            self.domain = None
+            self.cert_name = None
+        self.metering = metering.set_metering(metering.Metering(self))
         self.monitor = Event_Monitor()
         self.am = actormanager.ActorManager(self)
         self.control = calvincontrol.get_calvincontrol()
+        
         _scheduler = scheduler.DebugScheduler if _log.getEffectiveLevel() <= logging.DEBUG else scheduler.Scheduler
         self.sched = _scheduler(self, self.am, self.monitor)
-        self.control.start(node=self, uri=control_uri)
         self.async_msg_ids = {}
         self._calvinsys = CalvinSys(self)
 
@@ -82,6 +106,7 @@ class Node(object):
         self.proto = CalvinProto(self, self.network)
         self.pm = PortManager(self, self.proto)
         self.app_manager = appmanager.AppManager(self)
+
         # The initialization that requires the main loop operating is deferred to start function
         async.DelayedCall(0, self.start)
 
@@ -94,17 +119,21 @@ class Node(object):
         if msg_id in self.async_msg_ids:
             self.async_msg_ids[msg_id] = reply
 
-    def connect(self, actor_id=None, port_name=None, port_dir=None, port_id=None,
+    def connect(self, actor_id=None, port_name=None, port_dir=None, port_properties=None, port_id=None,
                 peer_node_id=None, peer_actor_id=None, peer_port_name=None,
-                peer_port_dir=None, peer_port_id=None, cb=None):
+                peer_port_dir=None, peer_port_properties=None, peer_port_id=None, cb=None):
+        if port_properties is None and port_dir is not None:
+            port_properties = {'direction': port_dir}
+        if peer_port_properties is None and peer_port_dir is not None:
+            peer_port_properties = {'direction': peer_port_dir}
         self.pm.connect(actor_id=actor_id,
                         port_name=port_name,
-                        port_dir=port_dir,
+                        port_properties=port_properties,
                         port_id=port_id,
                         peer_node_id=peer_node_id,
                         peer_actor_id=peer_actor_id,
                         peer_port_name=peer_port_name,
-                        peer_port_dir=peer_port_dir,
+                        peer_port_properties=peer_port_properties,
                         peer_port_id=peer_port_id,
                         callback=CalvinCB(self.logging_callback, preamble="connect cb")  if cb is None else cb)
 
@@ -123,9 +152,12 @@ class Node(object):
         _log.debug("peersetup(%s)" % (peers))
         peers_copy = peers[:]
         peer_node_ids = {}
-        self.network.join(peers,
-            callback=CalvinCB(self.logging_callback, preamble="peersetup cb") if cb is None else
-                     CalvinCB(self.peersetup_collect_cb, peers=peers_copy, peer_node_ids=peer_node_ids, org_cb=cb))
+        if not cb:
+            callback = CalvinCB(self.logging_callback, preamble="peersetup cb")
+        else:
+            callback = CalvinCB(self.peersetup_collect_cb, peers=peers_copy, peer_node_ids=peer_node_ids, org_cb=cb)
+
+        self.network.join(peers, callback=callback)
 
     def peersetup_collect_cb(self, status, uri, peer_node_id, peer_node_ids, peers, org_cb):
         if uri in peers:
@@ -141,20 +173,21 @@ class Node(object):
                    ('#' * 40, self.id, preamble if preamble else "*", args, kwargs, '#' * 40))
 
     def new(self, actor_type, args, deploy_args=None, state=None, prev_connections=None, connection_list=None):
+        # TODO requirements should be input to am.new
+        # TODO: make it possible to use security/credentials here.
+        actor_def, signer = self.am.lookup_and_verify(actor_type)
         actor_id = self.am.new(actor_type, args, state, prev_connections, connection_list,
-                        signature=deploy_args['signature'] if deploy_args and 'signature' in deploy_args else None)
+                               signature=deploy_args['signature'] if deploy_args and 'signature' in deploy_args else None,
+                               actor_def=actor_def)
         if deploy_args:
             app_id = deploy_args['app_id']
             if 'app_name' not in deploy_args:
                 app_name = app_id
             else:
                 app_name = deploy_args['app_name']
-            self.app_manager.add(app_id, app_name, actor_id)
+            self.app_manager.add(app_id, actor_id,
+                                 deploy_info = deploy_args['deploy_info'] if 'deploy_info' in deploy_args else None)
         return actor_id
-
-    def deployment_control(self, app_id, actor_id, deploy_args):
-        """ Updates an actor's deployment """
-        self.am.deployment_control(app_id, actor_id, deploy_args)
 
     def calvinsys(self):
         """Return a CalvinSys instance"""
@@ -172,12 +205,21 @@ class Node(object):
 
     def start(self):
         """ Run once when main loop is started """
-        # FIXME hardcoded which transport and encoder plugin we use, should be based on
-        self.network.register(['calvinip'], ['json'])
-        self.network.start_listeners([self.uri])
+        interfaces = _conf.get(None, 'transports')
+        self.network.register(interfaces, ['json'])
+        self.network.start_listeners(self.uri)
         # Start storage after network, proto etc since storage proxy expects them
-        self.storage.start()
+        self.storage.start(cb=CalvinCB(self._storage_started_cb))
         self.storage.add_node(self)
+
+        # Start control API
+        proxy_control_uri = _conf.get(None, 'control_proxy')
+        _log.debug("Start control API on %s with uri: %s and proxy: %s" % (self.id, self.control_uri, proxy_control_uri))
+        if proxy_control_uri is not None:
+            self.control.start(node=self, uri=proxy_control_uri, tunnel=True)
+        else:
+            if self.control_uri is not None:
+                self.control.start(node=self, uri=self.control_uri, external_uri=self.external_control_uri)
 
     def stop(self, callback=None):
         def stopped(*args):
@@ -194,6 +236,9 @@ class Node(object):
 
         _log.analyze(self.id, "+", {})
         self.storage.delete_node(self, cb=deleted_node)
+
+    def _storage_started_cb(self, *args, **kwargs):
+        self.authorization.register_node()
 
 
 def create_node(uri, control_uri, attributes=None):
@@ -213,7 +258,7 @@ def create_tracing_node(uri, control_uri, attributes=None):
         tmp = sys.stdout
         # Modules to ignore
         ignore = [
-            'fifo', 'calvin', 'actor', 'pickle', 'socket',
+            'queue', 'calvin', 'actor', 'pickle', 'socket',
             'uuid', 'codecs', 'copy_reg', 'string_escape', '__init__',
             'colorlog', 'posixpath', 'glob', 'genericpath', 'base',
             'sre_parse', 'sre_compile', 'fdesc', 'posixbase', 'escape_codes',
@@ -227,6 +272,8 @@ def create_tracing_node(uri, control_uri, attributes=None):
 
 
 def start_node(uri, control_uri, trace_exec=False, attributes=None):
+    if not security_modules_check():
+        raise Exception("Security module missing")
     _create_node = create_tracing_node if trace_exec else create_node
     p = Process(target=_create_node, args=(uri, control_uri, attributes))
     p.daemon = True

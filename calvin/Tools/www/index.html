@@ -1,1404 +1,373 @@
 <!DOCTYPE html>
-<meta charset="utf-8">
-<style>
-
-body { font: 12px Arial;}
-
-#applicationData {
-    float:left;
-    resize: both;
-    overflow: auto;
-}
-
-#applicationGraph {
-    float:left;
-    resize: both;
-    overflow: auto;
-}
-
-.spinner {
-    position: fixed;
-    top: 40%;
-    left: 40%;
-}
-
-/*----- Table selection -----*/
-table tr.active {background: #ccc;}
-
-/*----- Tabs -----*/
-.tabs {
-    float: left;
-    width:100%;
-    height: 50%;
-    clear: both;
-}
-
-    /*----- Tab Links -----*/
-    /* Clearfix */
-    .tab-links:after {
-        display:block;
-        clear:both;
-        content:'';
-    }
-
-    .tab-links li {
-        margin:0px 5px;
-        float:left;
-        list-style:none;
-    }
-
-        .tab-links a {
-            padding:9px 15px;
-            display:inline-block;
-            border-radius:3px 3px 0px 0px;
-            background:#7FB5DA;
-            color:#4c4c4c;
-            transition:all linear 0.15s;
-        }
-
-        .tab-links a:hover {
-            background:#a7cce5;
-            text-decoration:none;
-        }
-
-    li.active a, li.active a:hover {
-        background:#fff;
-        color:#4c4c4c;
-    }
-
-    /*----- Content of Tabs -----*/
-    .tab-content {
-        padding:15px;
-        border-radius:3px;
-        background:#fff;
-        width:100%;
-        height: 100%;
-    }
-
-        .tab {
-            display:none;
-        }
-
-        .tab.active {
-            display:block;
-        }
-
-#logData {
-    width:100%;
-    height: 50%;
-    clear: both;
-}
-
-div.ui-widget-header {
-  background: #7FB5DA;
-}
-</style>
+<head>
+    <meta charset="utf-8">
+    <link rel="stylesheet" type="text/css" href="css/bootstrap.min.css">
+    <link rel="stylesheet" type="text/css" href="css/calvin.css">
+</head>
 <body>
 <!-- Tabbed menu -->
 <div class="tabs">
-    <ul class="tab-links">
-        <li class="active"><a href="#tabPeers"><h2>Runtimes</h2></a></li>
-        <li><a href="#tabApplications"><h2>Applications</h2></a></li>
+    <ul class="nav nav-tabs" id="tabMenu">
+        <li class="active"><a data-target="#tabPeers" data-toggle="tab"><h2>Runtimes</h2></a></li>
+        <li><a data-target="#tabApplications" data-toggle="tab"><h2>Applications</h2></a></li>
+        <li><a data-target="#tabConnections" data-toggle="tab"><h2>Connections</h2></a></li>
     </ul>
 
     <div class="tab-content">
-        <div id="tabPeers" class="tab active">
-            <h3>Runtimes</h3>
-            <table id="peersTable">
+        <div id="tabPeers" class="tab-pane active">
+            <h4>Control API</h4>
+            <table class="table table-bordered table-striped" id="controlTable" style="width: 20%">
+            </table>
+            <h4>Runtimes</h4>
+            <table class="table table-bordered table-striped" id="peersTable">
                 <th align="left">ID</th>
+                <th align="left">Name</th>
                 <th align="left">URI</th>
                 <th align="left">Control URI</th>
+                <th align="left">Configure</th>
                 <th align="left">Destroy</th>
                 <th align="left">Deploy application</th>
-                <th align="left">Trace</th>
-            </table>
-            <h3>Attributes</h3>
-            <table id="peerTable">
             </table>
         </div>
 
-        <div id="tabApplications" class="tab">
+        <div id="tabApplications" class="tab-pane">
             <div id="applicationData">
-                <h2>Application</h2>
+                <h4>Application</h4>
+                <input type="checkbox" id="chkDrawApplication" onchange="toggleDrawConnections()" checked>Draw application graph<br>
+                &nbsp;&nbsp;<input type="checkbox" id="chkDrawConnections" checked>Draw connections<br>
+                &nbsp;&nbsp;<input type="checkbox" id="chkShowPortNames" checked>Show portnames<br>
                 <select id="applicationSelector" onchange="showApplication()"></select>
-                <table id="applicationsTable"></table>
-                <h3>Actor</h3>
+                <table class="table table-bordered table-striped" id="applicationsTable"></table>
+                <h4>Actor</h4>
                 <select id="actorSelector" onchange="updateSelectedActor()"></select>
-                <table id="actorsTable"></table>
-                <h3>Port</h3>
+                <table class="table table-bordered table-striped" id="actorsTable"></table>
+                <h4>Port</h4>
                 <select id="portSelector" onchange="showPort()"></select>
-                <table id="actorPortsTable"></table>
-                <h3>Tokens</h3>
-                <table id="actorPortFifoTable"></table>
+                <table class="table table-bordered table-striped" id="actorPortsTable"></table>
+                <h4>Tokens</h4>
+                <table class="table table-bordered table-striped" id="actorPortFifoTable"></table>
             </div>
             <div id="applicationGraph"></div>
+        </div>
+
+        <div id="tabConnections" class="tab-pane">
+            <div id="connectionsGraph"></div>
         </div>
     </div>
 </div>
 
 <!-- Log data from runtimes -->
 <div id="logData">
-    <h3>Trace</h3>
-    <table id="logTable" align="left" width="1100">
+    <h4>Trace</h4>
+    <button class="btn btn-primary btn-xs" style="margin-left: 5px;" onclick="startLog()">Start trace</button>
+    <button class="btn btn-danger btn-xs" style="margin-left: 5px;" onclick="stopLog()">Stop trace</button>
+    <button class="btn btn-default btn-xs" style="margin-left: 5px;" onclick="clearLog()">Clear trace</button>
+    <table class="table table-bordered table-striped" id="logTable" align="left" width="1200">
         <th align="left">Timestamp</th>
-        <th align="left">Node</th>
-        <th align="left">Type</th>
-        <th align="left">Actor</th>
-        <th align="left">Action method</th>
-        <th align="left">Consumed</th>
+        <th align="left">Node id</th>
+        <th align="left">Event type</th>
+        <th align="left">Id/Peer id</th>
+        <th align="left">Name/URI</th>
+        <th align="left">Type/Action/Peer</th>
+        <th align="left">Is shadow/Consumed</th>
         <th align="left">Produced</th>
+        <th align="left">Action result</th>
     </table>
 </div>
 
 <!-- Connect dialog -->
-<div id="connectDialog" title="Connect" style="display:none;">
-  <form>
-    <label for="connect_uri">Control URI:</label>
-    <br>
-    <input type="text" name="connect_uri" id="connect_uri" size="35" />
-    <br>
-    <label for="index_search">Peers index search</label>
-    <br>
-    <input type="text" name="index_search" id="index_search" size="35" />
-  </form>
+<div id="connectDialog" title="Connect" style="display:none;" class="modal modal-dialog">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h4 class="modal-title">Connect</h4>
+        </div>
+        <div class="modal-body">
+            <form>
+                <label for="connect_uri">Control URI:</label>
+                <br>
+                <input type="text" name="connect_uri" id="connect_uri" size="35" />
+                <br>
+                <input type="checkbox" id="chk_get_all_runtimes" checked>Get all runtimes<br>
+            </form>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-primary" onclick="connectHandler()">Connect</button>
+        </div>
+    </div>
+</div>
+
+<!-- Configure runtime dialog -->
+<div id="configDialog" title="Configure runtime" style="display:none;" class="modal modal-dialog">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h4 class="modal-title">Configure runtime</h4>
+        </div>
+        <div class="modal-body">
+            <form>
+                <ul class="nav nav-tabs" id="tabRuntimeConfig">
+                    <li class="active"><a data-target="#tabNodeName" data-toggle="tab"><h4>Name</h4></a></li>
+                    <li><a data-target="#tabNodeAddress" data-toggle="tab"><h4>Address</h4></a></li>
+                    <li><a data-target="#tabNodeOwner" data-toggle="tab"><h4>Owner</h4></a></li>
+                </ul>
+
+                <div class="tab-content">
+                    <div id="tabNodeName" class="tab-pane active">
+                        <table class="table table-bordered table-striped" id="nodeNameTable" style="width: 20%">
+                            <tr>
+                            <td>
+                            <label for="conf_name_organization">Organization:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_name_organization" id="conf_name_organization" size="35" />
+                            </td>
+                            </tr>
+                            <tr>
+                            <td>
+                            <label for="conf_name_organizationalUnit">Organizational unit:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_name_organizationalUnit" id="conf_name_organizationalUnit" size="35" />
+                            </td>
+                            </tr>
+                            <tr>
+                            <td>
+                            <label for="conf_name_purpose">Purpose:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_name_purpose" id="conf_name_purpose" size="35" />
+                            </td>
+                            </tr>
+                            <tr>
+                            <td>
+                            <label for="conf_name_group">Group:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_name_group" id="conf_name_group" size="35" />
+                            </td>
+                            </tr>
+                            <tr>
+                            <td>
+                            <label for="conf_name_name">Name:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_name_name" id="conf_name_name" size="35" />
+                            </td>
+                            </tr>
+                        </table>
+                    </div>
+                    <div id="tabNodeAddress" class="tab-pane">
+                        <table class="table table-bordered table-striped" id="nodeAddressTable" style="width: 20%">
+                            <tr>
+                            <td>
+                            <label for="conf_address_country">Country:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_address_country" id="conf_address_country" size="35" />
+                            </td>
+                            </tr>
+                            <tr>
+                            <td>
+                            <label for="conf_address_stateOrProvince">State or province:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_address_stateOrProvince" id="conf_address_stateOrProvince" size="35" />
+                            </td>
+                            </tr>
+                            <tr>
+                            <td>
+                            <label for="conf_address_locality">Locality:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_address_locality" id="conf_address_locality" size="35" />
+                            </td>
+                            </tr>
+                            <tr>
+                            <td>
+                            <label for="conf_address_street">Street:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_address_street" id="conf_address_street" size="35" />
+                            </td>
+                            </tr>
+                            <tr>
+                            <td>
+                            <label for="conf_address_streetNumber">Street number:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_address_streetNumber" id="conf_address_streetNumber" size="35" />
+                            </td>
+                            </tr>
+                            </tr>
+                            <tr>
+                            <td>
+                            <label for="conf_address_building">Building:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_address_building" id="conf_address_building" size="35" />
+                            </td>
+                            </tr>
+                            </tr>
+                            <tr>
+                            <td>
+                            <label for="conf_address_floor">Floor:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_address_floor" id="conf_address_floor" size="35" />
+                            </td>
+                            </tr>
+                            </tr>
+                            <tr>
+                            <td>
+                            <label for="conf_address_room">Room:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_address_room" id="conf_address_room" size="35" />
+                            </td>
+                            </tr>
+                        </table>
+                    </div>
+                    <div id="tabNodeOwner" class="tab-pane">
+                        <table class="table table-bordered table-striped" id="nodeOwnerTable" style="width: 20%">
+                            <tr>
+                            <td>
+                            <label for="conf_owner_organization">Organization:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_owner_organization" id="conf_owner_organization" size="35" />
+                            </td>
+                            </tr>
+                            <tr>
+                            <td>
+                            <label for="conf_owner_organizationalUnit">Organizational unit:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_owner_organizationalUnit" id="conf_owner_organizationalUnit" size="35" />
+                            </td>
+                            </tr>
+                            <tr>
+                            <td>
+                            <label for="conf_owner_role">Role:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_owner_role" id="conf_owner_role" size="35" />
+                            </td>
+                            </tr>
+                            <tr>
+                            <td>
+                            <label for="conf_owner_personOrGroup">Person or group:</label>
+                            </td>
+                            <td>
+                            <input type="text" name="conf_owner_personOrGroup" id="conf_owner_personOrGroup" size="35" />
+                            </td>
+                            </tr>
+                        </table>
+                    </div>
+                </div>
+            </form>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-primary" onclick="setRuntimeConfig()">Update</button>
+            <button type="button" class="btn btn-default" data-dismiss="modal">Close</button>
+        </div>
+    </div>
 </div>
 
 <!-- Application deployment dialog -->
-<div id="deployDialog" title="Deploy application" style="display:none;">
-  <form>
-    <input type="file" id="fileInputDeploy" accept=".calvin">
-    <br>
-    <label for="deploy_script">Script:</label>
-    <br>
-    <textarea name="deploy_script" id="deploy_script" rows="25" cols="100"></textarea>
-    <br>
-    <label for="name">Script name:</label>
-    <br>
-    <input type="text" name="script_name" id="script_name">
-  </form>
+<div id="deployDialog" title="Deploy application" style="display:none; width: 800px; height: 900px" class="modal modal-dialog">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h4 class="modal-title">Deploy</h4>
+        </div>
+        <div class="modal-body">
+            <form>
+                <input type="file" id="fileInputDeploy" accept=".calvin">
+                <br>
+                <label for="deploy_script">Script:</label>
+                <br>
+                <textarea name="deploy_script" id="deploy_script" rows="20" cols="100"></textarea>
+                <br>
+                <label for="deploy_requirements">Requirements:</label>
+                <br>
+                <input type="file" id="fileInputMigrateApplication" accept=".deployjson">
+                <br>
+                <textarea name="migrate_reqs" id="migrate_reqs" rows="20" cols="100"></textarea>
+                <br>
+                <label for="script_name">Script name:</label>
+                <br>
+                <input type="text" name="script_name" id="script_name">
+            </form>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-primary" onclick="deployHandler()" data-dismiss="modal">Deploy</button>
+            <button type="button" class="btn btn-default" data-dismiss="modal">Close</button>
+        </div>
+    </div>
 </div>
 
-<!-- Application migration dialog -->
-<div id="migrateDialog" title="Connect" style="display:none;">
-  <form>
-    <input type="file" id="fileInputMigrateApplication" accept=".deployjson">
-    <br>
-    <textarea name="migrate_reqs" id="migrate_reqs" rows="25" cols="100"></textarea>
-  </form>
+<!-- Event log dialog -->
+<div id="traceDialog" title="Event trace filter" style="display:none; height: 500px; width: 300px;" class="modal modal-dialog">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h4 class="modal-title">Event Trace Filter</h4>
+        </div>
+        <div class="modal-body">
+            <form>
+                <input type="checkbox" id="chkTraceLinkConnected" checked="">Link connect<br>
+                <input type="checkbox" id="chkTraceLinkDisconnected" checked="">Link disconnect<br>
+                <input type="checkbox" id="chkTraceActorFiring" onchange="toggleActionResult()" checked="">Actor firings<br>
+                &nbsp;&nbsp;<input type="checkbox" id="chkTraceActorFiringActionResult">Action result<br>
+                <input type="checkbox" id="chkTraceActorNew" checked="">Actor new<br>
+                <input type="checkbox" id="chkTraceActorDestroy" checked="">Actor destroy<br>
+                <input type="checkbox" id="chkTraceActorMigrate" checked="">Actor migrate<br>
+                <input type="checkbox" id="chkTraceApplicationNew" checked="">Application new<br>
+                <input type="checkbox" id="chkTraceApplicationDestroy" checked="">Application destroy<br>
+                Application: <select id="traceApplicationSelector"></select>
+                <br>
+                <label for="trace_size">Trace rows:</label>
+                <input type="number" name="trace_size" id="trace_size" value="30">
+            </form>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-primary" onclick="startTrace()">Start Trace</button>
+            <button type="button" class="btn btn-default" data-dismiss="modal">Close</button>
+        </div>
+    </div>
+</div>
+
+<!-- Set requirements dialog -->
+<div id="requirementsDialog" title="Set requirements" style="display:none; width: 600px; height: 800px" class="modal modal-dialog">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h4 class="modal-title">Set requirements</h4>
+        </div>
+        <div class="modal-body">
+            <form>
+                <label for="requirements">Requirements:</label>
+                <br>
+                <input type="file" id="fileInputRequirements" accept=".deployjson">
+                <br>
+                <textarea name="requirements" id="requirements" rows="20" cols="100"></textarea>
+            </form>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-primary" onclick="setRequirementsHandler()" data-dismiss="modal">Set requirements</button>
+            <button type="button" class="btn btn-default" data-dismiss="modal">Close</button>
+        </div>
+    </div>
 </div>
 
 <!-- Busy spinner -->
 <div id='spinner' class='spinner'></div>
 
+<!-- Alerts container -->
+<div id = "alerts-container" style="position: fixed; width: 30%; right: 0; top: 0;"></div>
+
 <!-- Dependencies -->
-<link rel="stylesheet" href="css/jquery-ui.min.css">
 <script src="lib/jquery.min.js"></script>
-<script src="lib/jquery-ui.min.js"></script>
-<script src="lib/viz.js"></script>
 <script src="lib/spin.js" type="text/javascript"></script>
-<script>
-var connect_uri;        // control uri of runtime
-var peers = [];         // runtimes
-var applications = [];  // applications
-var actors = [];        // actors
-var ports = [];         // actor ports
-
-// Clear application graph
-function clearApplicationGraph() {
-    document.getElementById("applicationGraph").innerHTML = "";
-}
-
-// Draw application with id "application_id"
-function drawApplication(application_id)
-{
-    startSpin();
-    var digraphActors = "digraph structs { node [shape=plaintext fontsize=\"10\", fontname=\"Arial\"]; rankdir=LR;\n";
-    var digraphConnections = "";
-    var application = findApplication(application_id);
-    if (application) {
-        var actor_index;
-        for (actor_index in application.actors) {
-            var actor = findActor(application.actors[actor_index]);
-            if (actor) {
-                var actor_name = actor.name.replace(/:/g, "_");
-                var actor_peer = findRuntime(actor.peer_id);
-                var actor_peer_address = actor_peer.control_uri.replace("http://", "");
-                digraphActors += actor_name + " [label=<\n";
-                digraphActors += "<TABLE BORDER=\"1\" CELLBORDER=\"0\" CELLSPACING=\"0\" CELLPADDING=\"1\">\n";
-                digraphActors += "<TR><TD bgcolor=\"lightblue\" COLSPAN=\"3\">" + actor.name + "</TD></TR>\n";
-                digraphActors += "<TR><TD COLSPAN=\"3\">" + actor.type + "</TD></TR>\n";
-                digraphActors += "<TR><TD COLSPAN=\"3\">" + actor_peer_address + "</TD></TR>\n";
-
-                // add inports and their connections
-                var port_index;
-                for (port_index in actor.inports) {
-                    var port = findPort(actor.inports[port_index]);
-                    if (port) {
-                        digraphActors += "<TR><TD bgcolor=\"lightgrey\" PORT=\"" + port.name + "_in\" align=\"left\">" + port.name + "</TD><TD ROWSPAN=\"1\">    </TD><TD align=\"right\"></TD></TR>\n";
-                        // add connection
-                        if (port.peer) {
-                            var peer_port = findPort(port.peer[1]);
-                            if (peer_port) {
-                                var peer_actor = findActor(peer_port.actor_id);
-                                if (peer_actor) {
-                                    var peer_actor_name = peer_actor.name.replace(/:/g, "_");
-                                    digraphConnections += peer_actor_name + ":" + peer_port.name + "_out:e -> " + actor_name + ":" + port.name + "_in:w;\n"
-                                } else {
-                                    console.log("No actor with id: " + peer_port.actor_id);
-                                }
-                            } else {
-                                console.log("No port with id: " + port.peer[1])
-                            }
-                        }
-                    }
-                }
-
-                // add outports and its connections
-                for (port_index in actor.outports) {
-                    var port = findPort(actor.outports[port_index]);
-                    if (port) {
-                        digraphActors += "<TR><TD align=\"left\"></TD><TD ROWSPAN=\"1\">    </TD><TD bgcolor=\"lightgrey\" PORT=\"" + port.name + "_out\" align=\"right\">" + port.name + "</TD></TR>\n";
-                    } else {
-                        console.log("No port with id: " + actor.outports[port_index]);
-                    }
-                }
-
-                digraphActors += "</TABLE>>];\n";
-            } else {
-                console.log("No actor with id: " + application.actors[actor_index]);
-            }
-        }
-    } else {
-        console.log("No application with id: " + application_id);
-    }
-
-    var digraph = digraphActors + digraphConnections + "}";
-    document.getElementById("applicationGraph").innerHTML = Viz(digraph);
-    stopSpin();
-}
-
-// Runtime object constructor function
-function runtimeObject(id)
-{
-    this.id = id;
-    this.actors = [];
-    this.source = null;
-}
-
-// Return runtime object from id
-function findRuntime(id)
-{
-    var index;
-    for (index in peers) {
-        if (peers[index].id == id) {
-            return peers[index];
-        }
-    }
-}
-
-// Application object constructor function
-function applicationObject(id)
-{
-    this.id = id;
-    this.actors = [];
-}
-
-// Return application object
-function findApplication(id)
-{
-    var index;
-    for (index in applications) {
-        if (applications[index].id == id) {
-            return applications[index];
-        }
-    }
-}
-
-// Actor object constructor function
-function actorObject(id)
-{
-    this.id = id;
-    this.inports = [];
-    this.outports = [];
-}
-
-// Return actor from id
-function findActor(id)
-{
-    var index;
-    for (index in actors) {
-        if (actors[index].id == id) {
-            return actors[index];
-        }
-    }
-}
-
-// Port object constructor function
-function portObject(id)
-{
-    this.id = id;
-}
-
-// Return port from id
-function findPort(id)
-{
-    var index;
-    for (index in ports) {
-        if (ports[index].id == id) {
-            return ports[index];
-        }
-    }
-}
-
-// Helper to clear table
-function clearTable(tableRef)
-{
-    for(var i = 0; i < tableRef.rows.length;) {
-       tableRef.deleteRow(i);
-    }
-}
-
-// Helper to clear combobox
-function clearCombo(selectbox)
-{
-    for(var i = 0; i < selectbox.options.length;) {
-        selectbox.remove(i);
-    }
-}
-
-// Busy spinner
-var opts = {
-    lines: 11, // The number of lines to draw
-    length: 15, // The length of each line
-    width: 10, // The line thickness
-    radius: 30, // The radius of the inner circle
-    corners: 1, // Corner roundness (0..1)
-    rotate: 0, // The rotation offset
-    direction: 1, // 1: clockwise, -1: counterclockwise
-    color: '#000', // #rgb or #rrggbb
-    speed: 0.6, // Rounds per second
-    trail: 60, // Afterglow percentage
-    shadow: false, // Whether to render a shadow
-    hwaccel: false, // Whether to use hardware acceleration
-    className: 'spinner', // The CSS class to assign to the spinner
-    zIndex: 2e9, // The z-index (defaults to 2000000000)
-    top: 'auto', // Top position relative to parent in px
-    left: 'auto' // Left position relative to parent in px
-};
-var spinner = new Spinner(opts);
-var spinner_div = $('#spinner').get(0);
-var spinCount = 0;
-
-// Start spinner
-function startSpin()
-{
-    if (spinCount == 0) {
-        spinner.spin(spinner_div);
-    }
-    spinCount = spinCount + 1;
-}
-
-// Stop spinner
-function stopSpin()
-{
-    spinCount = spinCount - 1;
-    if (spinCount == 0) {
-        spinner.stop();
-    }
-}
-
-// Helper to get cookie
-function getCookie(cname) {
-    var name = cname + "=";
-    var ca = document.cookie.split(';');
-    for(var i=0; i<ca.length; i++) {
-        var c = ca[i];
-        while (c.charAt(0)==' ') c = c.substring(1);
-        if (c.indexOf(name) == 0) return c.substring(name.length,c.length);
-    }
-    return "";
-}
-
-// Reset data, show connectDialog and get information from selected runtime
-function connect()
-{
-    peers = [];
-    applications = [];
-    actors = [];
-    ports = [];
-
-    clearTable(document.getElementById("peersTable"));
-
-    var uri = getCookie("calvin_uri");
-    var index_search = getCookie("calvin_indexsearch");
-
-    document.getElementById("connect_uri").value = uri;
-    document.getElementById("index_search").value = index_search;
-
-    $("#connectDialog").dialog({
-        modal: true,
-        buttons: {
-            "Connect": function() {
-                connect_uri = $("#connect_uri").val();
-                index_search = $("#index_search").val();
-                document.cookie="calvin_uri=" + connect_uri;
-                document.cookie="calvin_indexsearch=" + index_search;
-                getPeerID();
-                getPeers();
-                if (index_search) {
-                    getPeersFromIndex(index_search);
-                }
-                $(this).dialog("close");
-            },
-            "Cancel": function() {
-                $(this).dialog("close");
-            }
-        }
-    });
-}
-
-// Get id of peer with uri "uri"
-function getPeerID()
-{
-    var url = connect_uri + '/id';
-    console.log("getPeerID - url: " + url);
-    $.ajax({
-        timeout: 20000,
-        beforeSend: function() {
-            startSpin();
-        },
-        complete: function() {
-            stopSpin();
-        },
-        dataType: 'json',
-        url: url,
-        type: 'GET',
-        success: function(data) {
-            if (data) {
-                console.log("getPeerID - Response: " + JSON.stringify(data));
-                getPeer(data.id, true);
-            } else {
-                console.log("getPeerID - Empty response");
-            }
-        },
-        error: function() {
-            alert("Failed to get node id, url: " + url);
-        }
-    });
-}
-
-// Get peers from index "index"
-function getPeersFromIndex(index)
-{
-    var url = connect_uri + '/index/' + index;
-    console.log("getPeersFromIndex - url: " + url);
-    $.ajax({
-        timeout: 10000,
-        beforeSend: function() {
-            startSpin();
-        },
-        complete: function() {
-            stopSpin();
-        },
-        dataType: 'json',
-        url: url,
-        type: 'GET',
-        success: function(data) {
-            if (data) {
-                console.log("getPeersFromIndex response: " + JSON.stringify(data));
-                var index;
-                for (index in data.result) {
-                    if (!findRuntime(data.result[index])) {
-                        getPeer(data.result[index]);
-                    }
-                }
-            } else {
-                console.log("getPeersFromIndex - Empty response");
-            }
-        },
-        error: function() {
-            alert("Failed to get peers from index, url: " + url);
-        }
-    });
-}
-
-// Get connected peers
-function getPeers()
-{
-    var url = connect_uri + '/nodes';
-    console.log("getPeers - url: " + url);
-    $.ajax({
-        timeout: 20000,
-        beforeSend: function() {
-            startSpin();
-        },
-        complete: function() {
-            stopSpin();
-        },
-        dataType: 'json',
-        url: url,
-        type: 'GET',
-        success: function(data) {
-            if (data) {
-                console.log("getPeers response: " + JSON.stringify(data));
-                var index;
-                for (index in data) {
-                    if (!findRuntime(data[index])) {
-                        getPeer(data[index]);
-                    }
-                }
-            } else {
-                console.log("getPeers - Empty response");
-            }
-        },
-        error: function() {
-            alert("Failed to get peers, url: " + url);
-        }
-    });
-}
-
-// Get runtime information from runtime with id "id"
-function getPeer(id)
-{
-    var url = connect_uri + '/node/' + id;
-    console.log("getPeer - url: " + url);
-    $.ajax({
-        timeout: 20000,
-        beforeSend: function() {
-            startSpin();
-        },
-        complete: function() {
-            stopSpin();
-        },
-        dataType: 'json',
-        url: url,
-        type: 'GET',
-        success: function(data) {
-            if (data) {
-                console.log("getPeer response: " + JSON.stringify(data));
-                if (!findRuntime(id)) {
-                    var peer = new runtimeObject(id);
-                    peer.uri = data.uri;
-                    peer.control_uri = data.control_uri;
-                    peer.attributes = data.attributes;
-                    peers[peers.length] = peer;
-                    showPeer(peer);
-                }
-            } else {
-                console.log("getPeer - Empty response");
-            }
-        },
-        error: function() {
-            alert("Failed to get peer, url: " + url);
-        }
-    });
-}
-
-// Get applications from all runtimes
-function getApplications()
-{
-    console.log("getApplications");
-    clearTable(document.getElementById("applicationsTable"));
-    clearTable(document.getElementById("actorsTable"));
-    clearTable(document.getElementById("actorPortsTable"));
-    clearTable(document.getElementById("actorPortFifoTable"));
-    clearCombo(document.getElementById("actorSelector"));
-    clearCombo(document.getElementById("portSelector"));
-    var applicationSelector = document.getElementById("applicationSelector")
-    clearCombo(applicationSelector);
-    applicationSelector.options.add(new Option(""));
-    clearApplicationGraph();
-    applications = [];
-    actors = [];
-    var index;
-    for (index in peers) {
-        url = peers[index].control_uri + '/applications';
-        $.ajax({
-            uri: peers[index].control_uri,
-            timeout: 20000,
-            beforeSend: function() {
-                startSpin();
-            },
-            complete: function() {
-                stopSpin();
-            },
-            dataType: 'json',
-            url: url,
-            type: 'GET',
-            success: function(data) {
-                if (data) {
-                    console.log("getApplications - Response: " + JSON.stringify(data));
-                    var index_application;
-                    for (index_application in data) {
-                        getApplication(this.uri, data[index_application]);
-                    }
-                } else {
-                    console.log("getApplication - Empty result");
-                }
-            },
-            error: function() {
-                alert("Failed to get applications, url: " + url);
-            }
-        });
-    }
-}
-
-// Get application with id "id"
-function getApplication(uri, id)
-{
-    var url = uri + '/application/' + id;
-    console.log("getApplication - url: " + url);
-    $.ajax({
-        uri: uri,
-        timeout: 20000,
-        beforeSend: function() {
-            startSpin();
-        },
-        complete: function() {
-            stopSpin();
-        },
-        dataType: 'json',
-        url: url,
-        type: 'GET',
-        success: function(data) {
-            if (data) {
-                console.log("getApplication - Response: " + JSON.stringify(data));
-                var application = findApplication(id);
-                if (!application) {
-                    application = new applicationObject(id);
-                    applications[applications.length] = application;
-                }
-                application.name = data.name;
-                application.actors = data.actors;
-                application.control_uri = this.uri;
-                var applicationSelector = document.getElementById("applicationSelector");
-                var optionApplication = new Option(application.name);
-                optionApplication.id =  application.id;
-                applicationSelector.options.add(optionApplication);
-            } else {
-                console.log("getApplication - Empty response");
-            }
-        },
-        error: function() {
-            alert("Failed to get application, url: " + url);
-        }
-    });
-}
-
-// Get actor with id "id"
-function getActor(id, show)
-{
-    var url = connect_uri + '/actor/' + id;
-    console.log("getActor - url: " + url)
-    $.ajax({
-        timeout: 20000,
-        beforeSend: function() {
-            startSpin();
-        },
-        complete: function() {
-            stopSpin();
-        },
-        dataType: 'json',
-        url: url,
-        type: 'GET',
-        success: function(data) {
-            if (data) {
-                console.log("getActor - Response: " + JSON.stringify(data));
-                var actor = findActor(id);
-                if (!actor) {
-                    actor = new actorObject(id);
-                    actors[actors.length] = actor;
-                }
-                actor.id = id;
-                actor.name = data.name;
-                actor.type = data.type;
-                actor.peer_id = data.node_id;
-                actor.inports = [];
-                var index;
-                for (index in data.inports) {
-                    actor.inports[actor.inports.length] = data.inports[index].id;
-                    getPort(id, data.inports[index].id);
-                }
-                actor.outports = [];
-                for (index in data.outports) {
-                    actor.outports[actor.outports.length] = data.outports[index].id;
-                    getPort(id, data.outports[index].id);
-                }
-
-                if (show) {
-                    showActor();
-                } else {
-                    var actorSelector = document.getElementById("actorSelector");
-                    var optionActor = new Option(actor.name);
-                    optionActor.id =  actor.id;
-                    actorSelector.options.add(optionActor);
-                }
-            } else {
-                console.log("getActor - Empty response");
-            }
-        },
-        error: function() {
-            alert("Failed to get actor, url: " + url);
-        }
-    });
-}
-
-// Get port with id "port_id" on actor "actor_id" and draw application
-function getPort(actor_id, port_id)
-{
-    var url = connect_uri + '/actor/' + actor_id + '/port/' + port_id;
-    console.log("getPort - url: " + url);
-    $.ajax({
-        timeout: 20000,
-        beforeSend: function() {
-            startSpin();
-        },
-        complete: function() {
-            stopSpin();
-        },
-        dataType: 'json',
-        url: url,
-        type: 'GET',
-        success: function(data) {
-            if (data) {
-                console.log("getPort - Response: " + JSON.stringify(data));
-                var port = new portObject(port_id);
-                port.actor_id = data.actor_id;
-                port.direction = data.direction;
-                port.name = data.name;
-                port.connected = data.connected;
-                port.peer_id = data.node_id;
-                port.peers = []
-                if (port.direction == "out") {
-                    var index;
-                    for (index in data.peers) {
-                        port.peers[port.peers.length] = data.peers[index];
-                    }
-                }
-                if (port.direction == "in") {
-                    port.peer = data.peer;
-                }
-                ports[ports.length] = port;
-
-                // draw application
-                var selectedIndex = document.getElementById("applicationSelector").selectedIndex;
-                var selectOptions = document.getElementById("applicationSelector").options;
-                var application_id = selectOptions[selectedIndex].id;
-                if (application_id) {
-                    drawApplication(application_id);
-                }
-            } else {
-                console.log("getPort - Empty response");
-            }
-        },
-        error: function() {
-            alert("Failed to get port, url: " + url);
-        }
-    });
-}
-
-// Get state of port with id "port_id"
-function getPortState(port_id)
-{
-    var port = findPort(port_id);
-    if (port) {
-        var actor = findActor(port.actor_id);
-        if (actor) {
-            var runtime = findRuntime(actor.peer_id);
-            if (runtime) {
-                var url = runtime.control_uri + '/actor/' + port.actor_id + '/port/' + port_id + "/state";
-                console.log("getPort - url: " + url);
-                $.ajax({
-                    timeout: 20000,
-                    beforeSend: function() {
-                        startSpin();
-                    },
-                    complete: function() {
-                        stopSpin();
-                    },
-                    dataType: 'json',
-                    url: url,
-                    type: 'GET',
-                    success: function(data) {
-                        if (data) {
-                            console.log("getPortState - Response: " + JSON.stringify(data));
-                            var tableRef = document.getElementById('actorPortFifoTable');
-                            clearTable(tableRef);
-
-                            var fifos = data.fifo;
-                            for (fifo in fifos) {
-                                var fifo = fifos[fifo];
-                                AddTableItem(tableRef, document.createTextNode(fifo.type), document.createTextNode(JSON.stringify(fifo.data)));
-                            }
-                        } else {
-                            console.log("getPortState - Empty response");
-                        }
-                    },
-                    error: function() {
-                        alert("Failed to get port state, url: " + url);
-                    }
-                });
-            }
-        }
-    }
-}
-
-// Helper for adding a table row with elements
-function AddTableItem(tableRef, element1, element2, element3, element4, element5, element6)
-{
-    var row = tableRef.insertRow();
-    if (element1) {
-        var cell = row.insertCell(0);
-        cell.appendChild(element1);
-    }
-
-    if (element2) {
-        var cell = row.insertCell(1);
-        cell.appendChild(element2);
-    }
-
-    if (element3) {
-        var cell = row.insertCell(2);
-        cell.appendChild(element3);
-    }
-
-    if (element4) {
-        var cell = row.insertCell(3);
-        cell.appendChild(element4);
-    }
-
-    if (element5) {
-        var cell = row.insertCell(4);
-        cell.appendChild(element5);
-    }
-
-    if (element6) {
-        var cell = row.insertCell(5);
-        cell.appendChild(element6);
-    }
-
-    return row;
-}
-
-// Add "peer" to peersTable
-function showPeer(peer)
-{
-    var tableRef = document.getElementById('peersTable');
-
-    var btnDestroy = document.createElement('input');
-    btnDestroy.type = 'button';
-    btnDestroy.id = peer.id;
-    btnDestroy.value = 'Destroy';
-    btnDestroy.setAttribute("onclick", "destroyPeer(this.id)");
-
-    var btnDeploy = document.createElement('input');
-    btnDeploy.type = 'button';
-    btnDeploy.id = peer.id;
-    btnDeploy.value = 'Deploy...';
-    btnDeploy.setAttribute("onclick", "showDeployApplication(this.id)");
-
-    var chkTrace = document.createElement("input");
-    chkTrace.type = "checkbox";
-    chkTrace.id = peer.id;
-    chkTrace.setAttribute("onclick", "trace(this.id)");
-
-    var row = AddTableItem(tableRef, document.createTextNode(peer.id), document.createTextNode(peer.uri), document.createTextNode(peer.control_uri), btnDestroy, btnDeploy, chkTrace);
-    row.id = peer.id;
-    row.setAttribute("onclick", "showPeerAttributes(this.id); $(this).toggleClass(\"active\"); $(this).siblings().removeClass(\"active\");");
-}
-
-// Update peerTable with attributes from runtime with id "peer_id"
-function showPeerAttributes(peer_id)
-{
-    var peer = findRuntime(peer_id);
-    if (peer) {
-        var tableRef = document.getElementById('peerTable');
-        clearTable(tableRef);
-        if (peer.attributes.indexed_public) {
-            for (attribute in peer.attributes.indexed_public) {
-                AddTableItem(tableRef, document.createTextNode("Indexed public"), document.createTextNode(peer.attributes.indexed_public[attribute]));
-            }
-        }
-
-        if (peer.attributes.public) {
-            for (attribute in peer.attributes.public) {
-                AddTableItem(tableRef, document.createTextNode("Public"), document.createTextNode(peer.attributes.public[attribute]));
-            }
-        }
-    }
-}
-
-// Add "application" to applicationsTable
-function showApplication()
-{
-    var selectedIndex = document.getElementById("applicationSelector").selectedIndex;
-    var selectOptions = document.getElementById("applicationSelector").options;
-    var applicationID = selectOptions[selectedIndex].id;
-    var tableRef = document.getElementById('applicationsTable');
-    clearTable(tableRef);
-    var actorSelector = document.getElementById('actorSelector')
-    clearCombo(actorSelector);
-    actorSelector.options.add(new Option(""));
-    clearTable(document.getElementById('actorsTable'));
-    clearTable(document.getElementById("actorPortsTable"));
-    clearTable(document.getElementById("actorPortFifoTable"));
-    clearCombo(document.getElementById("portSelector"));
-    clearApplicationGraph();
-
-    var application = findApplication(applicationID);
-    if (application) {
-        //Name
-        AddTableItem(tableRef, document.createTextNode("Name"), document.createTextNode(application.name));
-
-        // ID
-        AddTableItem(tableRef, document.createTextNode("ID"), document.createTextNode(application.id));
-
-        // Destroy
-        var btnDestroy = document.createElement('input');
-        btnDestroy.type = 'button';
-        btnDestroy.id = application.id;
-        btnDestroy.value = 'Destroy';
-        btnDestroy.setAttribute("onclick", "destroyApplication(this.id)");
-        AddTableItem(tableRef, document.createTextNode("Destroy"), btnDestroy);
-
-        // Migrate dialog
-        var btnMigrate = document.createElement('input');
-        btnMigrate.type = 'button';
-        btnMigrate.id = application.id;
-        btnMigrate.value = 'Migrate...';
-        btnMigrate.setAttribute("onclick", "showMigrateApplication(this.id)");
-        AddTableItem(tableRef, document.createTextNode("Migrate..."), btnMigrate);
-
-        var index;
-        for (index in application.actors) {
-            getActor(application.actors[index], false);
-        }
-    }
-}
-
-// Update selected actor
-function updateSelectedActor()
-{
-    var selectedIndex = document.getElementById("actorSelector").selectedIndex;
-    var selectOptions = document.getElementById("actorSelector").options;
-    var actorID = selectOptions[selectedIndex].id;
-    if (actorID) {
-        getActor(actorID, true);
-    }
-}
-
-// Add "actor" to actorsTable
-function showActor()
-{
-    var selectedIndex = document.getElementById("actorSelector").selectedIndex;
-    var selectOptions = document.getElementById("actorSelector").options;
-    var actorID = selectOptions[selectedIndex].id;
-
-    var tableRef = document.getElementById('actorsTable');
-    clearTable(tableRef);
-    clearCombo(document.getElementById("portSelector"));
-    clearTable(document.getElementById("actorPortsTable"));
-    clearTable(document.getElementById("actorPortFifoTable"));
-
-    var actor = findActor(actorID);
-    if (actor) {
-        //Name
-        AddTableItem(tableRef, document.createTextNode("Name"), document.createTextNode(actor.name));
-
-        // ID
-        AddTableItem(tableRef, document.createTextNode("ID"), document.createTextNode(actor.id));
-
-        // Actor type
-        AddTableItem(tableRef, document.createTextNode("Type"), document.createTextNode(actor.type));
-
-        // ID
-        var runtime = findRuntime(actor.peer_id);
-        AddTableItem(tableRef, document.createTextNode("Runtime"), document.createTextNode(runtime.control_uri));
-
-        // Migrate
-        var selectNode = document.createElement("select");
-        selectNode.id = "selectRuntime";
-        var index;
-        for (index in peers) {
-            if (peers[index].id != actor.peer_id) {
-                selectNode.options.add(new Option(peers[index].control_uri));
-            }
-        }
-        var btnMigrate = document.createElement('input');
-        btnMigrate.type = 'button';
-        btnMigrate.id = actor.id;
-        btnMigrate.value = 'Migrate';
-        btnMigrate.setAttribute("onclick", "migrate(this.id)");
-        AddTableItem(tableRef, selectNode, btnMigrate);
-
-        // Add ports
-        var portSelector = document.getElementById("portSelector");
-        clearCombo(portSelector);
-        portSelector.options.add(new Option(""));
-
-        var index;
-        for (index in actor.inports) {
-            var port = findPort(actor.inports[index]);
-            if (port) {
-                var optionPort = new Option(port.name);
-                optionPort.id =  port.id;
-                portSelector.options.add(optionPort);
-            }
-        }
-        for (index in actor.outports) {
-            var port = findPort(actor.outports[index]);
-            if (port) {
-                var optionPort = new Option(port.name);
-                optionPort.id =  port.id;
-                portSelector.options.add(optionPort);
-            }
-        }
-    }
-}
-
-// update actorPortsTable
-function showPort()
-{
-    var selectedIndex = document.getElementById("portSelector").selectedIndex;
-    var selectOptions = document.getElementById("portSelector").options;
-    var portID = selectOptions[selectedIndex].id;
-
-    var tableRef = document.getElementById("actorPortsTable");
-    clearTable(tableRef);
-    clearTable(document.getElementById("actorPortFifoTable"));
-
-    var port = findPort(portID);
-    if (port) {
-        // Port name
-        AddTableItem(tableRef, document.createTextNode("Name"), document.createTextNode(port.name));
-
-        // Port id
-        AddTableItem(tableRef, document.createTextNode("ID"), document.createTextNode(port.id));
-
-        // Direction
-        AddTableItem(tableRef, document.createTextNode("Direction"), document.createTextNode(port.direction));
-
-        // Connected
-        AddTableItem(tableRef, document.createTextNode("Connected"), document.createTextNode(port.connected));
-
-        // Get fifo
-        var btnFifo = document.createElement('input');
-        btnFifo.type = 'button';
-        btnFifo.id = port.id;
-        btnFifo.value = 'Get fifo...';
-        btnFifo.setAttribute("onclick", "getPortState(this.id)");
-        AddTableItem(tableRef, document.createTextNode("Fifo"), btnFifo);
-    }
-}
-
-// Migrate actor with "actor_id" to selected runtime in combobox in actorsTable
-function migrate(actor_id)
-{
-    var combo = document.getElementById('selectRuntime');
-    var peer_control_uri = combo.options[combo.selectedIndex].text;
-    var index;
-    for (index in peers) {
-        if (peers[index].control_uri == peer_control_uri) {
-            var actor = findActor(actor_id);
-            if (actor) {
-                var node = findRuntime(actor.peer_id);
-                if (node) {
-                    var url = node.control_uri + '/actor/' + actor.id + '/migrate';
-                    var data = JSON.stringify({'peer_node_id': peers[index].id});
-                    console.log("migrate - url: " + url + " data: " + data);
-                    $.ajax({
-                        timeout: 20000,
-                        beforeSend: function() {
-                            startSpin();
-                        },
-                        complete: function() {
-                            stopSpin();
-                        },
-                        url: url,
-                        type: 'POST',
-                        data: data,
-                        success: function() {
-                            getActor(actor_id, true);
-                        },
-                        error: function() {
-                            console.log("Failed to migrate");
-                        }
-                    });
-                } else {
-                    console.log("migrate - No node with id: " + actor.peer_id);
-                }
-            }
-        }
-    }
-}
-
-// Destroy application with "application_id"
-function destroyApplication(application_id)
-{
-    var application = findApplication(application_id);
-    if (application) {
-        var url = application.control_uri + '/application/' + application_id
-        console.log("destroyApplication url: " + url)
-        $.ajax({
-            timeout: 20000,
-            beforeSend: function() {
-                startSpin();
-            },
-            complete: function() {
-                stopSpin();
-            },
-            url: url,
-            type: 'DELETE',
-            success: function() {
-                getApplications();
-            },
-            error: function() {
-                alert("Failed to destroy application");
-            }
-        });
-    } else {
-        console.log("destroyApplication - No application with id: " + application_id);
-    }
-}
-
-// Destroy runtime with id "peer_id"
-function destroyPeer(peer_id)
-{
-    var peer = findRuntime(peer_id);
-    if (peer) {
-        var url = peer.control_uri + '/node';
-        console.log("destroyPeer url: " + url);
-
-        if (peer.source != null) {
-            peer.source.removeEventListener("message", eventHandler, false);
-        }
-
-        $.ajax({
-            timeout: 20000,
-            beforeSend: function() {
-                startSpin();
-            },
-            complete: function() {
-                stopSpin();
-            },
-            url: url,
-            type: 'DELETE',
-            success: function() {
-                var tableRef = document.getElementById('peersTable');
-                for (var x = 0; x < tableRef.rows.length; x++) {
-                    if (tableRef.rows[x].cells[0].innerHTML == peer_id) {
-                        tableRef.deleteRow(x);
-                        return;
-                    }
-                }
-            },
-            error: function() {
-                alert("Failed to destroy peer");
-            }
-        });
-    } else {
-        console.log("destroyPeer - No peer with id: " + peer_id);
-    }
-}
-
-// Start/stop log stream on "peer_id"
-function trace(peer_id)
-{
-    var peer = findRuntime(peer_id);
-    if (peer) {
-        var tableRef = document.getElementById('peersTable');
-        for (var x = 0; x < tableRef.rows.length; x++) {
-            if (tableRef.rows[x].cells[0].innerHTML == peer_id) {
-                if (tableRef.rows[x].cells[5].childNodes[0].checked == true) {
-                    peer.source = new EventSource(peer.control_uri + '/log');
-                    peer.source.addEventListener("message", eventHandler, false);
-                } else {
-                    peer.source.removeEventListener("message", eventHandler, false);
-                    peer.source = null;
-                }
-                return;
-            }
-        }
-    } else {
-        console.log("trace - No peer with id: " + peer_id);
-    }
-}
-
-// Event handler for log data
-function eventHandler(event)
-{
-    var data = JSON.parse(event.data);
-    var tableRef = document.getElementById('logTable');
-    var newRow = tableRef.insertRow(1);
-    var cell0 = newRow.insertCell(0);
-    var cell1 = newRow.insertCell(1);
-    var cell2 = newRow.insertCell(2);
-    var cell3 = newRow.insertCell(3);
-    var cell4 = newRow.insertCell(4);
-    var cell5 = newRow.insertCell(5);
-    var cell6 = newRow.insertCell(6);
-
-    cell0.appendChild(document.createTextNode(data.timestamp));
-    cell1.appendChild(document.createTextNode(data.node_id));
-    cell2.appendChild(document.createTextNode(data.type));
-    if (data.type == "fire") {
-        cell3.appendChild(document.createTextNode(data.actor));
-        cell4.appendChild(document.createTextNode(data.action_method));
-        cell5.appendChild(document.createTextNode(data.consumed));
-        cell6.appendChild(document.createTextNode(data.produced));
-    }
-}
-
-// Show dialog for deploying application on "peer_id"
-function showDeployApplication(peer_id)
-{
-    var peer = findRuntime(peer_id);
-    if (peer) {
-        $("#deployDialog").dialog({
-            modal: true,
-            width: 800,
-            height: 600,
-            buttons: {
-                "Deploy": function() {
-                    var script = $("#deploy_script").val();
-                    var name = $("#script_name").val();
-                    deployApplication(peer.control_uri, script, name);
-                    $(this).dialog("close");
-                },
-                "Cancel": function() {
-                    $(this).dialog("close");
-                }
-            }
-        });
-    }
-}
-
-// Deploy application with "script" and "name" to runtime with "uri"
-function deployApplication(uri, script, name)
-{
-    var url = uri + '/deploy';
-    var data = JSON.stringify({'script': script, 'name': name});
-    console.log("deployApplication url: " + url + " data: " + data);
-    $.ajax({
-        timeout: 20000,
-        beforeSend: function() {
-            startSpin();
-        },
-        complete: function() {
-            stopSpin();
-        },
-        url: url,
-        type: 'POST',
-        data: data,
-        success: function(data) {
-            console.log("deployApplication - Success");
-        },
-        error: function() {
-            alert("Failed to deploy application, url: " + url + " data: " + data);
-        }
-    });
-}
-
-// Show dialog for migrating "application_id"
-function showMigrateApplication(application_id)
-{
-    var application = findApplication(application_id);
-    if (application) {
-        $("#migrateDialog").dialog({
-            modal: true,
-            width: 800,
-            height: 600,
-            buttons: {
-                "Migrate": function() {
-                    var script = $("#migrate_reqs").val();
-                    migrateApplication(application, script);
-                    $(this).dialog("close");
-                },
-                "Cancel": function() {
-                    $(this).dialog("close");
-                }
-            }
-        });
-    }
-}
-
-// Migrate "application" with deployment from "script"
-function migrateApplication(application, script)
-{
-    var url = application.control_uri + "/application/" + application.id + "/migrate";
-    var deploy_data = JSON.parse(script);
-    var data = JSON.stringify({'reqs': deploy_data});
-    console.log("migrateApplication url: " + url + " data: " + data);
-    $.ajax({
-        timeout: 20000,
-        beforeSend: function() {
-            startSpin();
-        },
-        complete: function() {
-            stopSpin();
-        },
-        url: url,
-        type: 'POST',
-        data: data,
-        success: function(data) {
-            console.log("migrateApplication - Success");
-        },
-        error: function() {
-            alert("Failed to migrate application, url: " + url + " data: " + data);
-        }
-    });
-}
-
-jQuery(document).ready(function() {
-    connect();
-
-    // handle file select in deploy app
-    var fileInputDeploy = document.getElementById('fileInputDeploy');
-    var fileDisplayDeploy = document.getElementById('deploy_script');
-    fileInputDeploy.addEventListener('change', function(e) {
-        var file = fileInputDeploy.files[0];
-        var reader = new FileReader();
-        document.getElementById('script_name').value = file.name.split(".")[0];
-
-        reader.onload = function(e) {
-            fileDisplayDeploy.innerHTML = e.target.result;
-        }
-
-        reader.readAsText(file);
-    });
-
-    // handle file select in migrate application
-    var fileInputMigrate = document.getElementById('fileInputMigrateApplication');
-    var fileDisplayMigrate = document.getElementById('migrate_reqs');
-    fileInputMigrate.addEventListener('change', function(e) {
-        var file = fileInputMigrate.files[0];
-        var reader = new FileReader();
-
-        reader.onload = function(e) {
-            fileDisplayMigrate.innerHTML = e.target.result;
-        }
-
-        reader.readAsText(file);
-    });
-
-    // handle tabbed view
-    jQuery('.tabs .tab-links a').on('click', function(e)  {
-        var currentAttrValue = jQuery(this).attr('href');
-
-        if (currentAttrValue == "#tabApplications") {
-            getApplications();
-        }
-
-        // Show/Hide Tabs
-        jQuery('.tabs ' + currentAttrValue).show().siblings().hide();
-
-        // Change/remove current tab to active
-        jQuery(this).parent('li').addClass('active').siblings().removeClass('active');
-
-        e.preventDefault();
-    });
-});
-
-</script>
+<script src="js/bootstrap.min.js" type="text/javascript"></script>
+<script src="js/d3.v3.min.js"></script>
+<script src="js/dagre-d3.min.js"></script>
+<script src="js/calvin.js" type="text/javascript"></script>
 </body>
 </html>

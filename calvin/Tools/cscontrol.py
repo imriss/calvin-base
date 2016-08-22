@@ -17,24 +17,29 @@
 
 import argparse
 import json
-import calvin.utilities.utils as utils
-import os
 from calvin.utilities.calvinlogger import get_logger
-from calvin.utilities import calvinresponse
-import logging
+from calvin.utilities.security import Security
+from calvin.utilities import certificate
 
 _log = get_logger(__name__)
+_request_handler = None
+
+
+def get_request_handler():
+    from calvin.requests.request_handler import RequestHandler
+    return _request_handler if _request_handler else RequestHandler()
 
 
 def control_id(args):
-    return utils.get_node_id(args.node)
+    return get_request_handler().get_node_id(args.node)
 
 
 def get_node_info(control_uri, node_id):
     try:
-        return utils.get_node(control_uri, node_id)
+        return get_request_handler().get_node(control_uri, node_id)
     except:
         raise Exception("No node with id {} found".format(node_id))
+
 
 def get_node_control_uri(control_uri, node_id):
     nodeinfo = get_node_info(control_uri, node_id)
@@ -44,12 +49,12 @@ def get_node_control_uri(control_uri, node_id):
 def requirements_file(path):
     """ Reads in a requirements file of JSON format with the structure:
         {<actor_name>: [(<req_op>, <req_args>), ...], ...}
-        
-        Needs to be called after the initial deployment to get the actor_ids
+
+        Needs to be called after the initial add_argument to get the actor_ids
     """
     reqs = None
     try:
-        reqs = json.load(open(path,'r'))
+        reqs = json.load(open(path, 'r'))
     except:
         _log.exception("Failed JSON file")
     if not reqs or not isinstance(reqs, dict):
@@ -57,60 +62,83 @@ def requirements_file(path):
         return {}
     return reqs
 
+
 def control_deploy(args):
     response = None
-    print args
+    reqs = requirements_file(args.reqs) if args.reqs else None
+    if args.signer:
+        conf = certificate.Config(configfile=None, domain=args.signer, readonly=True)
+        certificate.sign_file(conf, args.script.name)
+    source_text = args.script.read()
+    credentials_ = None
+    content = None
+    if args.credentials:
+        try:
+            credentials_ = json.loads(args.credentials)
+        except Exception as e:
+            print "Credentials not JSON:\n", e
+            return -1
+        if credentials_:
+            content = Security.verify_signature_get_files(args.script.name, skip_file=True)
+            if content:
+                content['file'] = source_text
     try:
-        response = utils.deploy_application(args.node, args.script.name, args.script.read(), args.check)
+        response = get_request_handler().deploy_application(args.node, args.script.name, source_text, reqs,
+                                            credentials=credentials_, content=content, check=args.check)
     except Exception as e:
         print e
-    if isinstance(response, dict) and "application_id" in response and args.reqs:
-        reqs = requirements_file(args.reqs)
-        if reqs:
-            try:
-                result = utils.add_requirements(args.node, response["application_id"], reqs)
-                _log.debug("Succeeded with applying deployment requirements %s\n" % result['placement'])
-            except:
-                _log.error("Applying deployment requirement from file %s failed" % args.reqs)
-                print ("Applying deployment requirement from file %s failed" % args.reqs)
     return response
+
 
 def control_actors(args):
     if args.cmd == 'list':
-        return utils.get_actors(args.node)
+        return get_request_handler().get_actors(args.node)
     if args.cmd == 'info':
         if not args.id:
             raise Exception("No actor id given")
-        return utils.get_actor(args.node, args.id)
+        return get_request_handler().get_actor(args.node, args.id)
     elif args.cmd == 'delete':
         if not args.id:
             raise Exception("No actor id given")
-        return utils.delete_actor(args.node, args.id)
+        return get_request_handler().delete_actor(args.node, args.id)
     elif args.cmd == 'migrate':
         if not args.id or not args.peer_node:
             raise Exception("No actor or peer given")
-        return utils.migrate(args.node, args.id, args.peer_node)
+        return get_request_handler().migrate(args.node, args.id, args.peer_node)
 
 
 def control_applications(args):
-    if args.cmd == 'list':
-        return utils.get_applications(args.node)
+    if args.cmd == 'info':
+        if not args.id:
+            raise Exception("No application id given")
+        return get_request_handler().get_application(args.node, args.id)
+    elif args.cmd == 'list':
+        return get_request_handler().get_applications(args.node)
     elif args.cmd == 'delete':
         if not args.id:
             raise Exception("No application id given")
-        return utils.delete_application(args.node, args.id)
+        return get_request_handler().delete_application(args.node, args.id)
+    elif args.cmd == 'migrate':
+        if not args.id:
+            raise Exception("No application id given")
+        deploy_info = requirements_file(args.reqs) if args.reqs else None
+        return get_request_handler().migrate_app_use_req(rt=args.node, application_id=args.id, deploy_info=deploy_info)
 
 
 def control_nodes(args):
     from requests.exceptions import ConnectionError
-    if args.cmd == 'list':
-        return utils.get_nodes(args.node)
+    if args.cmd == 'info':
+        if not args.id:
+            raise Exception("No node id given")
+        return get_request_handler().get_node(args.node, args.id)
+    elif args.cmd == 'list':
+        return get_request_handler().get_nodes(args.node)
     elif args.cmd == 'add':
-        return utils.peer_setup(args.node, *args.peerlist)
+        return get_request_handler().peer_setup(args.node, *(args.peerlist + [ args.id ]))
     elif args.cmd == 'stop':
         try:
-            return utils.quit(args.node)
-        except ConnectionError as e:
+            return get_request_handler().quit(args.node)
+        except ConnectionError:
             # If the connection goes down before response that is OK
             return None
 
@@ -118,19 +146,20 @@ def control_nodes(args):
 def control_storage(args):
     from calvin.utilities.attribute_resolver import format_index_string
     import json
+    request_handler = get_request_handler()
     if args.cmd == 'get_index':
         try:
             index = json.loads(args.index)
         except:
             raise Exception("Malformed JSON index string:\n%s" % args.index)
         formated_index = format_index_string(index)
-        return utils.get_index(args.node, formated_index)
+        return request_handler.get_index(args.node, formated_index)
     elif args.cmd == 'raw_get_index':
         try:
             index = json.loads(args.index)
         except:
             raise Exception("Malformed JSON index string:\n%s" % args.index)
-        return utils.get_index(args.node, index)
+        return request_handler.get_index(args.node, index)
 
 
 def parse_args():
@@ -146,13 +175,16 @@ def parse_args():
     cmd_id.set_defaults(func=control_id)
 
     # parser for nodes cmd
-    node_commands = ['list', 'add', 'stop']
+    node_commands = ['info', 'list', 'add', 'stop']
 
     cmd_nodes = cmdparsers.add_parser('nodes', help='handle node peers')
     cmd_nodes.add_argument('cmd', metavar='<command>', choices=node_commands, type=str,
                            help="one of %s" % ", ".join(node_commands))
-    cmd_nodes.add_argument('peerlist', metavar='<peer>', nargs='*', default=[],
-                           help="list of peers of the form calvinip://<address>:<port>")
+    info_group = cmd_nodes.add_argument_group('info')
+    info_group.add_argument('id', metavar='<node id>', nargs='?', help="id of node to get info about")
+    list_group = cmd_nodes.add_argument_group('add')
+    list_group.add_argument('peerlist', metavar='<peer>', nargs='*', default=[],
+                            help="list of peers of the form calvinip://<address>:<port>")
     cmd_nodes.set_defaults(func=control_nodes)
 
     # parser for deploy
@@ -160,12 +192,20 @@ def parse_args():
     cmd_deploy.add_argument("script", metavar="<calvin script>", type=argparse.FileType('r'),
                             help="script to be deployed")
     cmd_deploy.add_argument('-c', '--no-check', dest='check', action='store_false', default=True,
-                           help='Don\'t verify if actors or components are correct, ' + 
+                           help='Don\'t verify if actors or components are correct, ' +
                                 'allows deployment of actors not known on the node')
+    cmd_deploy.add_argument('--credentials', metavar='<credentials>', type=str,
+                           help='Supply credentials to run program under '
+                                'e.g. \'{"user":"ex_user", "password":"passwd"}\'',
+                           dest='credentials', default=None)
+
+    cmd_deploy.add_argument('--sign-org', metavar='<signer>', type=str,
+                           help='Sign the app before deploy, using this code signing organization name supplied',
+                           dest='signer', default=None)
 
     cmd_deploy.add_argument('--reqs', metavar='<reqs>', type=str,
-                           help='deploy script, currently JSON coded data file',
-                           dest='reqs')
+                            help='deploy script, currently JSON coded data file',
+                            dest='reqs')
     cmd_deploy.set_defaults(func=control_deploy)
 
     # parsers for actor commands
@@ -180,18 +220,22 @@ def parse_args():
     cmd_actor.set_defaults(func=control_actors)
 
     # parser for applications
-    app_commands = ['list', 'delete']
+    app_commands = ['info', 'list', 'delete', 'migrate']
     cmd_apps = cmdparsers.add_parser('applications', help="handle applications deployed on node")
     cmd_apps.add_argument("cmd", metavar="<command>", choices=app_commands, type=str,
                           help="one of %s" % (", ".join(app_commands)))
     cmd_apps.add_argument("id", metavar="<app id>", type=str, nargs='?')
+    cmd_apps.add_argument('--reqs', metavar='<reqs>', type=str,
+                            help='deploy script, currently JSON coded data file (when migrating)',
+                            dest='reqs')
+    
     cmd_apps.set_defaults(func=control_applications)
 
     # parser for applications
     storage_commands = ['get_index', 'raw_get_index']
     cmd_storage = cmdparsers.add_parser('storage', help="handle storage")
     cmd_storage.add_argument("cmd", metavar="<command>", choices=storage_commands, type=str,
-                          help="one of %s" % (", ".join(storage_commands)))
+                             help="one of %s" % (", ".join(storage_commands)))
     cmd_storage.add_argument("index", metavar="<index>",
                              help="An index e.g. '[\"owner\", {\"personOrGroup\": \"Me\"}}]'", type=str, nargs='?')
     cmd_storage.set_defaults(func=control_storage)
@@ -203,7 +247,7 @@ def main():
     args = parse_args()
     try:
         r =  args.func(args)
-        print "OK" if r is None else r
+        print "OK" if r is None else json.dumps(r, indent=2)
     except Exception as e:
         print "Error {}".format(e)
 if __name__ == '__main__':

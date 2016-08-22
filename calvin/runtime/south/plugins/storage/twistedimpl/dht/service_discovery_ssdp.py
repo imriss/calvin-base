@@ -52,7 +52,7 @@ MS_RESP =   'HTTP/1.1 200 OK\r\n' + \
             'SERVER: %s\r\nlast-seen: %s\r\nEXT: \r\nSERVICE: %s\r\n' + \
             'LOCATION: http://calvin@github.se/%s/description-0.0.1.xml\r\n' % SERVICE_UUID + \
             'CACHE-CONTROL: max-age=1800\r\nST: uuid:%s\r\n' % SERVICE_UUID + \
-            'DATE: %s\r\n\r\n'
+            'DATE: %s\r\n'
 
 def parse_http_response(data):
 
@@ -71,11 +71,12 @@ def parse_http_response(data):
 
 
 class ServerBase(DatagramProtocol):
-    def __init__(self, ips, d=None):
+    def __init__(self, ips, cert=None, d=None):
         self._services = {}
         self._dstarted = d
         self.ignore_list = []
         self.ips = ips
+        self.cert = cert
 
     def startProtocol(self):
         if self._dstarted:
@@ -101,6 +102,11 @@ class ServerBase(DatagramProtocol):
 
                             response = MS_RESP % ('%s:%d' % addr, str(time.time()),
                                                   k, datetimeToString())
+                            if self.cert != None:
+                                response = "{}CERTIFICATE: ".format(response)
+                                response = "{}{}".format(response, self.cert)
+                            response = "{}\r\n\r\n".format(response)
+
                             _log.debug("Sending response: %s" % repr(response))
                             delay = random.randint(0, min(5, int(headers['mx'])))
                             reactor.callLater(delay, self.send_it,
@@ -162,7 +168,11 @@ class ClientBase(DatagramProtocol):
             if SERVICE_UUID in headers['st']:
                 c_address = headers['server'].split(':')
                 c_address[1] = int(c_address[1])
-
+                try:
+                    cert = headers['certificate'].split(':')
+                    c_address.extend(cert)
+                except KeyError:
+                    pass
                 # Filter on service calvin networks
                 if self._service is None or \
                    self._service == headers['service']:
@@ -193,7 +203,7 @@ class ClientBase(DatagramProtocol):
 
 
 class SSDPServiceDiscovery(ServiceDiscoveryBase):
-    def __init__(self, iface='', ignore_self=True):
+    def __init__(self, iface='', cert=None, ignore_self=True):
         super(SSDPServiceDiscovery, self).__init__()
 
         self.ignore_self = ignore_self
@@ -202,6 +212,7 @@ class SSDPServiceDiscovery(ServiceDiscoveryBase):
         self.port = None
         self._backoff = .2
         self.iface_send_list = []
+        self.cert = cert
 
         if self.iface in ["0.0.0.0", ""]:
             for a in netifaces.interfaces():
@@ -217,10 +228,13 @@ class SSDPServiceDiscovery(ServiceDiscoveryBase):
         dserver = defer.Deferred()
         dclient = defer.Deferred()
         try:
-            self.ssdp = reactor.listenMulticast(SSDP_PORT, ServerBase(self.iface_send_list, d=dserver),
-                                                interface=self.iface, listenMultiple=True)
-            self.ssdp.setLoopbackMode(1)
-            self.ssdp.joinGroup(SSDP_ADDR, interface=self.iface)
+            self.ssdp = reactor.listenMulticast(SSDP_PORT, ServerBase(self.iface_send_list, cert=self.cert, d=dserver),
+                                                listenMultiple=True)
+            self.ssdp.setTTL(5)
+            for iface_ in self.iface_send_list:
+                d = self.ssdp.joinGroup(SSDP_ADDR, interface=iface_)
+                d.addErrback(lambda x: _log.error("Failed to join multicast group %s:%s, %s", iface_, SSDP_PORT, x))
+                d.addCallback(lambda x: _log.debug("Joined multicast group %s:%s, %s", iface_, SSDP_PORT, x))
         except:
             _log.exception("Multicast listen join failed!!")
             # Dont start server some one is alerady running locally

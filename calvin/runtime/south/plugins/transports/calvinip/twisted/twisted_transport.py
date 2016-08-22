@@ -16,7 +16,7 @@
 
 from calvin.utilities.calvin_callback import CalvinCB, CalvinCBClass
 from calvin.utilities import calvinlogger
-from calvin.runtime.south.plugins.transports.calvinip import base_transport
+from calvin.runtime.south.plugins.transports.lib.twisted import base_transport
 
 from twisted.protocols.basic import Int32StringReceiver
 from twisted.internet import reactor, protocol
@@ -70,9 +70,13 @@ class StringProtocol(CalvinCBClass, Int32StringReceiver):
     def __init__(self, callbacks):
         super(StringProtocol, self).__init__(callbacks)
         self._callback_execute('set_proto', self)
+        self.MAX_LENGTH = 1024*1024*20
 
     def connectionMade(self):
         self._callback_execute('connected', self)
+
+    def lengthLimitExceeded(self, length):
+        _log.error("String length recieved to big package was dumped, length was %s and max length is %s", length, self.MAX_LENGTH)
 
     def connectionLost(self, reason):
         self._callback_execute('disconnected', reason)
@@ -138,6 +142,9 @@ class TwistedCalvinTransport(base_transport.CalvinTransportBase):
 
     def _set_proto(self, proto):
         _log.debug("%s, %s, %s" % (self, '_set_proto', proto))
+        if self._proto:
+            _log.error("_set_proto: Already connected")
+            return
         self._proto = proto
 
     def _connected(self, proto):

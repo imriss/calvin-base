@@ -1,0 +1,18 @@
+{
+	"id": "policy5",
+	"description": "Only application signer 'signer' permitted for 'Anders', 'David', 'Elin'",
+	"rule_combining": "permit_overrides",
+	"target": {
+		"subject": {
+			"first_name": ["Anders", "David", "Elin"],
+			"application_signer": "signer"
+		}
+	},
+	"rules": [
+		{
+			"id": "policy5_rule1",
+			"description": "Permit if policy target matches",
+			"effect": "permit"
+		}
+	]
+}

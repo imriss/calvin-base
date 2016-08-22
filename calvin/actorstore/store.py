@@ -23,8 +23,12 @@ import re
 from types import ModuleType
 import hashlib
 
+from calvin.csparser.astnode import node_encoder, node_decoder
 from calvin.utilities import calvinconfig
+from calvin.utilities import dynops
 from calvin.utilities.calvinlogger import get_logger
+from calvin.utilities.calvin_callback import CalvinCB
+
 
 _log = get_logger(__name__)
 _conf = calvinconfig.get()
@@ -90,7 +94,7 @@ class Store(object):
         """
             Subclass must set 'conf_paths_name' before calling superclass init.
         """
-        base_path = os.path.dirname(__file__)
+        base_path = os.path.abspath(os.path.dirname(__file__))
         # paths = [p for p in _conf.get('global', self.conf_paths_name) if not os.path.isabs(p)]
         # abs_paths = [p for p in _conf.get('global', self.conf_paths_name) if os.path.isabs(p)]
         paths = _conf.get('global', self.conf_paths_name)
@@ -101,6 +105,7 @@ class Store(object):
 
     def update(self):
         """Should be called after a module has been added at runtime."""
+        _log.debug("Store update SECURITY %s" % str(self.sec))
         self._MODULE_CACHE = self.find_all_modules()
 
 
@@ -110,15 +115,15 @@ class Store(object):
             if not os.path.exists(path):
                 continue
 
-            for dir, subdirs, _ in os.walk(path):
-                rel_path = os.path.relpath(dir, path)
+            for current, subdirs, _ in os.walk(path):
+                rel_path = os.path.relpath(current, path)
                 # Skip top directory
                 if rel_path == '.':
                     continue
                 namespace = _rel_path_to_namespace(rel_path)
-                files = _files_in_dir(dir, ('.py', '.comp'))
+                files = _files_in_dir(current, ('.py', '.comp'))
 
-                yield (dir, namespace, files)
+                yield (current, namespace, files)
 
                 # Exclude special directories
                 for exclude in self._excluded_dirs:
@@ -128,9 +133,17 @@ class Store(object):
 
     def _load_pymodule(self, name, path):
         if not os.path.isfile(path):
-            return None
+            return (None, None)
         pymodule = None
+        signer = None
+        _log.debug("Store load_pymodule SECURITY %s" % str(self.sec))
         try:
+            if self.sec:
+                _log.debug("Verify signature for %s actor" % name)
+                verified, signer = self.sec.verify_signature(path, "actor")
+                if self.verify and not verified:
+                    _log.debug("Failed verification of signature for %s actor" % name)
+                    raise Exception("Actor security signature verification failed")
             pymodule = imp.load_source(name, path)
             # Check if we have a module or not
             if not isinstance(pymodule, ModuleType):
@@ -139,17 +152,17 @@ class Store(object):
         except Exception as e:
             _log.exception("Could not load python module")
         finally:
-            return pymodule
+            return (pymodule, signer)
 
 
     def _load_pyclass(self, name, path):
         if not os.path.isfile(path):
-            return None
-        pymodule = self._load_pymodule(name, path)
+            return (None, None)
+        pymodule, signer = self._load_pymodule(name, path)
         pyclass = pymodule and pymodule.__dict__.get(name, None)
         if not pyclass:
             _log.debug("No entry %s in %s" % (name, path))
-        return pyclass
+        return (pyclass, signer)
 
 
     def find_all_modules(self):
@@ -186,11 +199,13 @@ class Store(object):
 # Actor Store
 #
 class ActorStore(Store):
-    __metaclass__ = Singleton
 
-    def __init__(self):
+    def __init__(self, security=None, verify=True):
         self.conf_paths_name = 'actor_paths'
         super(ActorStore, self).__init__()
+        self.sec = security
+        self.verify = verify
+        _log.debug("ActorStore init SECURITY %s" % str(self.sec))
         self.update()
 
 
@@ -200,38 +215,42 @@ class ActorStore(Store):
 
 
     def load_actor(self, actor_type, actor_path):
-        actor_class = self._load_pyclass(actor_type, actor_path)
+        actor_class, signer = self._load_pyclass(actor_type, actor_path)
         if actor_class:
             inports, outports = self._gather_ports(actor_class)
             actor_class.inport_names = inports
             actor_class.outport_names = outports
-        return actor_class
+        return actor_class, signer
 
 
     def lookup(self, qualified_name):
         """
         Look up actor using qualified_name, e.g. foo.bar.Actor
+        If self.sec is set use it to verify access rights
         Return a tuple (found, is_primitive, info) where
             found:         boolean
             is_primitive:  boolean
             info:          if is_primitive is
                             True  => actor object
                             False => component definition dictionary
+            signer:         name of actor signer (string) if security is used, else None
         """
+        _log.debug("ActorStore lookup SECURITY %s" % str(self.sec))
         namespace, _, actor_type = qualified_name.rpartition('.')
         # Search in the order given by config
         for path in self.paths_for_module(namespace):
             # Primitives has precedence over components
             actor_path = os.path.join(path, actor_type + '.py')
-            actor_class = self.load_actor(actor_type, actor_path)
+            actor_class, signer = self.load_actor(actor_type, actor_path)
             if actor_class:
-                return (True, True, actor_class)
+                return (True, True, actor_class, signer)
         for path in self.paths_for_module(namespace):
             actor_path = os.path.join(path, actor_type + '.comp')
+            # TODO add credential verification of components
             comp = self.load_component(actor_type, actor_path)
             if comp:
-                return (True, False, comp)
-        return (False, False, None)
+                return (True, False, comp, None)
+        return (False, False, None, None)
 
 
     def _parse_docstring(self, class_):
@@ -285,7 +304,7 @@ class ActorStore(Store):
             return None
         try:
           with open(path, 'r') as source:
-            dict = json.load(source)
+            dict = json.load(source, object_hook=node_decoder)
         except Exception as e:
           _log.exception("Failed to read source for component '%s' : " % ( name, ))
           return None
@@ -308,7 +327,7 @@ class ActorStore(Store):
           _log.error('namespace creation not implemented: %s' % namespace)
           return False
       qualified_name = namespace + "." + component_type
-      found, is_primitive, _ = self.lookup(qualified_name)
+      found, is_primitive, _, signer = self.lookup(qualified_name)
       if found and is_primitive:
           _log.error("Can't overwrite actor: %s" % qualified_name)
           return False
@@ -322,7 +341,7 @@ class ActorStore(Store):
 
       try:
         with open(filepath, 'w') as f:
-          json.dump(comp, f)
+          json.dump(comp, f, default=node_encoder, indent=2)
       except Exception as e:
          _log.exception("Could not write component to: %s" % filepath)
          return False
@@ -335,6 +354,22 @@ class ActorStore(Store):
         for path in self.paths_for_module(namespace):
             actors = actors + [_basename(x) for x in _files_in_dir(path, ('.py', '.comp')) if '__init__.py' not in x]
         return actors
+
+    def actor_paths(self, module):
+        # Depth first
+        l = []
+        prefix = module + "." if module else ""
+        for m in self.modules(module):
+            l = l + self.actor_paths(prefix + m)
+        actors = []
+        for path in self.paths_for_module(module):
+            actors = actors + [x for x in _files_in_dir(path, ('.py', '.comp')) if '__init__.py' not in x]
+        if not l and not actors:
+            # Fully qualifying name?
+            namespace, name = module.rsplit('.', 1)
+            for path in self.paths_for_module(namespace):
+                actors = actors + [x for x in _files_in_dir(path, ('.py', '.comp')) if _basename(x) == name]
+        return l + actors
 
 
 class DocumentationStore(ActorStore):
@@ -370,7 +405,7 @@ class DocumentationStore(ActorStore):
 
 
     def actor_docs(self, actor_type):
-        found, is_primitive, actor = self.lookup(actor_type)
+        found, is_primitive, actor, signer = self.lookup(actor_type)
         if not found:
             return None
         if is_primitive:
@@ -401,17 +436,31 @@ class DocumentationStore(ActorStore):
     def component_docs(self, comp_type, compdef):
         """Combine info from compdef to raw docs"""
         namespace, name = comp_type.rsplit('.', 1)
-        doctext = compdef['docstring'].splitlines()
+        if type(compdef) is dict:
+            doctext = compdef['docstring'].splitlines()
+            return {
+                'ns': namespace, 'name': name,
+                'type': 'component',
+                 'short_desc': doctext[0],
+                 'long_desc': '\n'.join(doctext[1:]),
+                 'requires':list({compdef['structure']['actors'][a]['actor_type'] for a in compdef['structure']['actors']}),
+                 'args': {'mandatory':compdef['arg_identifiers'], 'optional':{}},
+                 'inputs': [(p, self._fetch_port_docs(compdef, 'in', p)) for p in compdef['inports']],
+                 'outputs': [(p, self._fetch_port_docs(compdef, 'out', p)) for p in compdef['outports']],
+            }
+        # print compdef.inports, compdef.outports
+        doctext = compdef.docstring.splitlines()
         doc = {
             'ns': namespace, 'name': name,
             'type': 'component',
             'short_desc': doctext[0],
             'long_desc': '\n'.join(doctext[1:]),
-            'requires':list({compdef['structure']['actors'][a]['actor_type'] for a in compdef['structure']['actors']}),
-            'args': {'mandatory':compdef['arg_identifiers'], 'optional':{}},
-            'inputs': [(p, self._fetch_port_docs(compdef, 'in', p)) for p in compdef['inports']],
-            'outputs': [(p, self._fetch_port_docs(compdef, 'out', p)) for p in compdef['outports']],
-            }
+            'requires':["FIXME"], # FIXME
+            'args': {'mandatory':compdef.arg_names, 'optional':{}},
+            'inputs': [(x, "FIXME") for x in compdef.inports or []], # FIXME append port docs
+            'outputs': [(x, "FIXME") for x in compdef.outports or []], # FIXME append port docs
+            'definition':compdef.children[0]
+        }
         return doc
 
 
@@ -582,9 +631,10 @@ class GlobalStore(ActorStore):
         Currently supports meta information on actors and full components
     """
 
-    def __init__(self, node=None, runtime=None):
-        super(GlobalStore, self).__init__()
+    def __init__(self, node=None, runtime=None, security=None, verify=True):
+        super(GlobalStore, self).__init__(security, verify)
         self.node = node  # Used inside runtime
+        # FIXME this is not implemented
         self.rt = runtime  # Use Control API from outside runtime
 
     def _collect(self, ns=None):
@@ -598,14 +648,19 @@ class GlobalStore(ActorStore):
         """ Takes actor/component description and
             generates a signature string
         """
-        if desc['is_primitive']:
-            signature = {'actor_type': desc['actor_type'],
-                         'inports': sorted(desc['inports']),
-                         'outports': sorted(desc['outports'])}
+        if 'is_primitive' not in desc or desc['is_primitive']:
+            signature = {u'actor_type': unicode(desc['actor_type']),
+                         u'inports': sorted([unicode(i) for i in desc['inports']]),
+                         u'outports': sorted([unicode(i) for i in desc['outports']])}
         else:
-            signature = {'actor_type': desc['actor_type'],
-                         'inports': sorted(desc['component']['inports']),
-                         'outports': sorted(desc['component']['outports'])}
+            if type(desc['component']) is dict:
+                signature = {u'actor_type': unicode(desc['actor_type']),
+                             u'inports': sorted([unicode(i) for i in desc['component']['inports']]),
+                             u'outports': sorted([unicode(i) for i in desc['component']['outports']])}
+            else:
+                signature = {u'actor_type': unicode(desc['actor_type']),
+                             u'inports': sorted([unicode(i) for i in desc['component'].inports]),
+                             u'outports': sorted([unicode(i) for i in desc['component'].outports])}
         return hashlib.sha256(json.dumps(signature, separators=(',', ':'), sort_keys=True)).hexdigest()
 
     @staticmethod
@@ -627,15 +682,21 @@ class GlobalStore(ActorStore):
         """ Takes actor/component description and
             generates one hash of the complete info
         """
-        return hashlib.sha256(json.dumps(GlobalStore.list_sort(desc), separators=(',', ':'), sort_keys=True)).hexdigest()
+        # return hashlib.sha256(json.dumps(GlobalStore.list_sort(desc), separators=(',', ':'), sort_keys=True)).hexdigest()
+        # FIXME: This is a temporary hack to make things work while we rewrite the store and signing infrastructure
+        return hashlib.sha256(GlobalStore.actor_signature(desc)).hexdigest()
 
     def export_actor(self, desc):
         signature = self.actor_signature(desc)
         hash = self.actor_hash(desc)
         if self.node:
             # FIXME should have callback to verify OK
-            self.node.storage.add_index(['actor', 'signature', signature], hash, root_prefix_level=3)
+            self.node.storage.add_index(['actor', 'signature', signature, self.node.id], hash, root_prefix_level=3)
             # FIXME should have callback to verify OK
+            # FIXME: This is a temporary hack to make things work while we rewrite the store and signing infrastructure
+            if 'component' in desc and type(desc['component']) is not dict:
+                mess = json.dumps(desc['component'], default=node_encoder)
+                desc['component'] = json.loads(mess)
             self.node.storage.set('actor_type-', hash, desc, None)
         else:
             print "global store index %s -> %s" %(signature, hash)
@@ -644,21 +705,22 @@ class GlobalStore(ActorStore):
         self.qualified_actor_list = []
         self._collect()
         for a in self.qualified_actor_list:
-            found, is_primitive, actor = self.lookup(a)
+            found, is_primitive, actor, signer = self.lookup(a)
             if not found:
                 continue
             # Currently only args and requires differences that would generate multiple hits
             if is_primitive:
                 inputs, outputs, _ = self._parse_docstring(actor)
                 args = self._get_args(actor)
-                desc = {'is_primitive': is_primitive, 
+                desc = {'is_primitive': is_primitive,
                         'actor_type': a,
                         'args': args,
                         'inports': [p[0] for p in inputs],
                         'outports': [p[0] for p in outputs],
-                        'requires': actor.requires if hasattr(actor, 'requires') else []}
+                        'requires': actor.requires if hasattr(actor, 'requires') else [],
+                        'signer': signer}
             else:
-                desc = {'is_primitive': is_primitive, 
+                desc = {'is_primitive': is_primitive,
                         'actor_type': a,
                         'component': actor}
             self.export_actor(desc)
@@ -677,7 +739,7 @@ class GlobalStore(ActorStore):
             nbr = [len(value)]
             actors = []
             for a in value:
-                self.node.storage.get('actor_type-', a, 
+                self.node.storage.get('actor_type-', a,
                             CalvinCB(self._global_lookup_collect, nbr, actors, signature=signature, org_cb=org_cb))
 
     def _global_lookup_collect(self, key, value, nbr, actors, signature, org_cb):
@@ -685,6 +747,59 @@ class GlobalStore(ActorStore):
         nbr[0] -= 1
         if nbr[0] == 0:
             org_cb(signature=signature, description=actors)
+
+    def global_lookup_actor(self, out_iter, kwargs, final, actor_type_id):
+        _log.analyze(self.node.id, "+", {'actor_type_id': actor_type_id})
+        if final[0]:
+            _log.analyze(self.node.id, "+ FINAL", {'actor_type_id': actor_type_id, 'counter': kwargs['counter']})
+            out_iter.auto_final(kwargs['counter'])
+        else:
+            kwargs['counter'] += 1
+            self.node.storage.get_iter('actor_type-', actor_type_id, it=out_iter)
+            _log.analyze(self.node.id, "+ GET", {'actor_type_id': actor_type_id, 'counter': kwargs['counter']})
+
+    def filter_actor_on_params(self, out_iter, kwargs, final, desc):
+        param_names = kwargs.get('param_names', [])
+        if not final[0] and desc != dynops.FailedElement:
+            if desc['is_primitive']:
+                mandatory = desc['args']['mandatory']
+                optional = desc['args']['optional'].keys()
+            else:
+                mandatory = desc['component']['arg_identifiers']
+                optional = []
+            # To be valid actor type all mandatory params need to be supplied and only valid params
+            if all([p in param_names for p in mandatory]) and all([p in (mandatory + optional) for p in param_names]):
+                _log.analyze(self.node.id, "+ FOUND DESC", {'desc': desc})
+                out_iter.append(desc)
+        if final[0]:
+            out_iter.final()
+
+    def global_lookup_iter(self, signature, param_names=None, node_id=None):
+        """ Lookup the described actor type
+            signature is the actor/component signature
+            param_names is optional list argument to filter out any descriptions which does not support the params
+            returns a dynops iterator with all found matching descriptions
+        """
+        if node_id is None:
+            sign_iter = self.node.storage.get_index_iter(['actor', 'signature', signature]).set_name("signature")
+        else:
+            sign_iter = self.node.storage.get_index_iter(['actor', 'signature', signature, node_id]).set_name("signature")
+        actor_type_iter = dynops.Map(self.global_lookup_actor, sign_iter, counter=0, eager=True)
+        if param_names is None:
+            actor_type_iter.set_name("global_lookup")
+            return actor_type_iter
+        filtered_actor_type_iter = dynops.Map(self.filter_actor_on_params, actor_type_iter, param_names=param_names,
+                                              eager=True)
+        actor_type_iter.set_name("unfiltered_global_lookup")
+        filtered_actor_type_iter.set_name("global_lookup")
+        return filtered_actor_type_iter
+
+
+
+def install_component(namespace, definition, overwrite):
+    astore = ActorStore()
+    return astore.add_component(namespace, definition.name, definition, overwrite)
+
 
 if __name__ == '__main__':
     import json
@@ -706,13 +821,13 @@ if __name__ == '__main__':
     print "====="
     print ds.help(what='std.SumActor', compact=True)
     print "====="
-    print ds.help(what='misc.ArgWrapper', compact=False)
+    print ds.help(what='std.Foo', compact=False)
     print "====="
     print ds.help(what='misc.ArgWrapper', compact=True)
 
     print
     for actor in ['std.Constant', 'std.Join', 'std.Identity', 'io.FileReader']:
-        found, is_primitive, actor_class = a.lookup(actor)
+        found, is_primitive, actor_class, signer = a.lookup(actor)
         if not found or not is_primitive:
             raise Exception('Bad actor')
         print actor, ":", ds._get_args(actor_class)

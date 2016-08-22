@@ -19,56 +19,18 @@ import os
 import sys
 import json
 import argparse
-from calvin.csparser.parser import calvin_parser
-from calvin.csparser.checker import check
-from calvin.csparser.analyzer import generate_app_info
-from calvin.utilities.calvinlogger import get_logger
+from calvin.csparser.cscompile import compile_script, appname_from_filename
 
-_log = get_logger(__name__)
-
-
-def compile(source_text, filename='', verify=True):
-    # Steps taken:
-    # 1) parser .calvin file -> IR. May produce syntax errors/warnings
-    # 2) checker IR -> IR. May produce syntax errors/warnings
-    # 3) analyzer IR -> app. Should not fail. Sets 'valid' property of IR to True/False
-    deployable = {'valid': False, 'actors': {}, 'connections': {}}
-    _log.debug("Parsing...")
-    ir, errors, warnings = calvin_parser(source_text, filename)
-    _log.debug("Parsed %s, %s, %s" % (ir, errors, warnings))
-    # If there were errors during parsing no IR will be generated
-    if not errors:
-        c_errors, c_warnings = check(ir, verify=verify)
-        errors.extend(c_errors)
-        warnings.extend(c_warnings)
-        deployable = generate_app_info(ir, verify=verify)
-        if errors:
-            deployable['valid'] = False
-    _log.debug("Compiled %s, %s, %s" % (deployable, errors, warnings))
-    return deployable, errors, warnings
-
-
-def compile_file(file):
-    with open(file, 'r') as source:
+def compile_file(filename, credentials=None):
+    with open(filename, 'r') as source:
         sourceText = source.read()
-        return compile(sourceText, file)
-
+        appname = appname_from_filename(filename)
+        return compile_script(sourceText, appname, credentials=credentials)
 
 def compile_generator(files):
-    for file in files:
-        deployable, errors, warnings = compile_file(file)
-        yield((deployable, errors, warnings, file))
-
-
-def remove_debug_info(deployable):
-    pass
-    # if type(d)==type({}):
-    #     d.pop('dbg_line', None)
-    #     for item in d:
-    #         _remove_debug_symbols(d[item])
-    # elif type(d)==type([]):
-    #     for item in d:
-    #         _remove_debug_symbols(item)
+    for filename in files:
+        deployable, issuetracker = compile_file(filename)
+        yield((deployable, issuetracker, filename))
 
 
 def main():
@@ -82,8 +44,8 @@ def main():
 
     argparser.add_argument('files', metavar='<filename>', type=str, nargs='+',
                            help='source file to compile')
-    argparser.add_argument('-d', '--debug', dest='debug', action='store_true', default=False,
-                           help='leave debugging information in output')
+    # argparser.add_argument('-d', '--debug', dest='debug', action='store_true', default=False,
+    #                        help='leave debugging information in output')
     argparser.add_argument('--stdout', dest='to_stdout', action='store_true',
                            help='send output to stdout instead of file (default)')
     argparser.add_argument('--compact', dest='indent', action='store_const', const=None, default=4,
@@ -91,43 +53,36 @@ def main():
     argparser.add_argument('--sorted', dest='sorted', action='store_true', default=False,
                            help='sort resulting JSON output by keys')
     argparser.add_argument('--issue-fmt', dest='fmt', type=str,
-                           default='{issue_type}: {reason} {script} [{line}:{col}]',
+                           default='{type!c}: {reason} {script} {line}:{col}',
                            help='custom format for issue reporting.')
     argparser.add_argument('--verbose', action='store_true',
                            help='informational output from the compiler')
 
     args = argparser.parse_args()
 
-    def report_issues(issues, issue_type, file=''):
-        sorted_issues = sorted(issues, key=lambda k: k.get('line', 0))
-        for issue in sorted_issues:
-            sys.stderr.write(args.fmt.format(script=file, issue_type=issue_type, **issue) + '\n')
 
     exit_code = 0
-    for deployable, errors, warnings, file in compile_generator(args.files):
-        if errors:
-            report_issues(errors, 'Error', file)
+    for deployable, issuetracker, filename in compile_generator(args.files):
+        if issuetracker.error_count:
+            for issue in issuetracker.formatted_errors(sort_key='line', custom_format=args.fmt, script=filename, line=0, col=0):
+                sys.stderr.write(issue + "\n")
             exit_code = 1
-        if warnings and args.verbose:
-            report_issues(warnings, 'Warning', file)
+        if issuetracker.warning_count and args.verbose:
+            for issue in issuetracker.formatted_warnings(sort_key='line', custom_format=args.fmt, script=filename, line=0, col=0):
+                sys.stderr.write(issue + "\n")
         if exit_code == 1:
             # Don't produce output if there were errors
             continue
-        if not args.debug:
-            # FIXME: Debug information is not propagated from IR to deployable by Analyzer.
-            #        When it is, this is the place to remove it
-            remove_debug_info(deployable)
         string_rep = json.dumps(deployable, indent=args.indent, sort_keys=args.sorted)
         if args.to_stdout:
             print(string_rep)
         else:
-            path, ext = os.path.splitext(file)
+            path, ext = os.path.splitext(filename)
             dst = path + ".json"
             with open(dst, 'w') as f:
                 f.write(string_rep)
 
     return exit_code
-
 
 if __name__ == '__main__':
     sys.exit(main())

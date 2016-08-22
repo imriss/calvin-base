@@ -14,9 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import traceback
-import copy
-
 from calvin.utilities import calvinuuid
 from calvin.utilities import calvinlogger
 
@@ -37,10 +34,15 @@ class CalvinCB(object):
         self.func = func
         self.args = list(args)
         self.kwargs = kwargs
+        # Ref a functions name if we wrap several CalvinCB and need to take __str__
+        try:
+            self.name = self.func.__name__
+        except:
+            self.name = self.func.name if hasattr(self.func, 'name') else "unknown"
 
     def args_append(self, *args):
         """ Append specific args to the call"""
-        self.args.append(args)
+        self.args.append(*args)
 
     def kwargs_update(self, **kwargs):
         """ Update specific kwargs to the call"""
@@ -56,10 +58,12 @@ class CalvinCB(object):
         try:
             return self.func(*(self.args + list(args)), **dict(self.kwargs, **kwargs))
         except:
-            _log.exception("When callback %s %s(%s, %s) is called caught the exception" % (self.func, self.func.__name__, (self.args + list(args)), dict(self.kwargs, **kwargs)))
+            _log.exception("When callback %s %s(%s, %s) is called caught the exception" % (
+                self.func, self.func.__name__, (self.args + list(args)), dict(self.kwargs, **kwargs)))
 
     def __str__(self):
-        return "CalvinCB - " + self.func.__name__ + "(%s, %s)" % (self.args, self.kwargs)
+        return "CalvinCB - " + self.name + "(%s, %s)" % (self.args, self.kwargs)
+
 
 class CalvinCBGroup(object):
     """ A group of callbacks that will have some common args
@@ -67,7 +71,7 @@ class CalvinCBGroup(object):
 
         For example see example code at end of file.
     """
-    def __init__(self, funcs = None):
+    def __init__(self, funcs=None):
         super(CalvinCBGroup, self).__init__()
         self.id = calvinuuid.uuid("CBG")
         self.funcs = funcs if funcs else []
@@ -105,15 +109,14 @@ class CalvinCBClass(object):
 
         For example see example code at end of file.
     """
-    def __init__(self, callbacks = None, callback_valid_names = None):
+    def __init__(self, callbacks=None, callback_valid_names=None):
         self.__callbacks = {}
         self.__callback_valid_names = callback_valid_names
         if not callbacks:
             return
         for name, cbs in callbacks.iteritems():
-            if self.__callback_valid_names == None or name in self.__callback_valid_names:
+            if self.__callback_valid_names is None or name in self.__callback_valid_names:
                 self.__callbacks[name] = dict([(cb.id, cb) for cb in cbs])
-
 
     def callback_valid_names(self):
         """ Returns list of valid or current names that callbacks can be registered on."""
@@ -124,7 +127,7 @@ class CalvinCBClass(object):
             name: a name string
             cb: a callback of CalvinCB or CalvinCBGroup type
         """
-        if self.__callback_valid_names == None or name in self.__callback_valid_names:
+        if self.__callback_valid_names is None or name in self.__callback_valid_names:
             if name not in self.__callbacks:
                 self.__callbacks[name] = {}
             self.__callbacks[name][cb.id] = cb
@@ -136,6 +139,8 @@ class CalvinCBClass(object):
         for k, v in self.__callbacks.iteritems():
             if _id in v:
                 self.__callbacks[k].pop(_id)
+                if not self.__callbacks[k]:
+                    del self.__callbacks[k]
                 break
 
     def _callback_execute(self, name, *args, **kwargs):
@@ -148,7 +153,7 @@ class CalvinCBClass(object):
         """
         reply = {}
 
-        if not name in self.__callbacks:
+        if name not in self.__callbacks:
             _log.debug("No callback registered for '%s'" % name)
             # tb_str = ''
             # for a in traceback.format_stack(limit=10)[:-1]:
@@ -164,6 +169,7 @@ class CalvinCBClass(object):
             except:
                 _log.exception("Callback '%s' failed on %s(%s, %s)" % (name, cb, args, kwargs))
         return reply
+
 
 if __name__ == '__main__':
     def fname(arg1, arg2, kwarg1):
@@ -191,7 +197,7 @@ if __name__ == '__main__':
     b.func_append(CalvinCB(fname, 2))
     b.func_append(CalvinCB(fname3))
     b.func_append(CalvinCB(fname2))
-    b(50, kwarg1 = 10)
+    b(50, kwarg1=10)
 
     class TestingCB(CalvinCBClass):
         """docstring for Testing"""
@@ -206,9 +212,8 @@ if __name__ == '__main__':
             print "------------------"
             print ">>>", self._callback_execute("test2", 500, kwarg1=13)
 
-    t = TestingCB(1, callbacks={'test1': [a], 'test2':[b]})
+    t = TestingCB(1, callbacks={'test1': [a], 'test2': [b]})
     t.callback_register('test1', CalvinCB(fname2))
     t.callback_unregister(a.id)
     print t.callback_valid_names()
     t.internal()
-
