@@ -1,4 +1,4 @@
-from calvin.actor.actor import Actor, ActionResult, condition, manage
+from calvin.actor.actor import Actor, condition, manage
 
 
 class RCSwitch(Actor):
@@ -63,7 +63,7 @@ class RCSwitch(Actor):
 
         # Output data
         self.gpio.shift_out(bits, self.repeat)
-        return ActionResult()
+        
 
     action_priority = (switch_state, )
     requires = ["calvinsys.io.gpiohandler"]

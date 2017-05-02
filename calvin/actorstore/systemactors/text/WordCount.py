@@ -17,7 +17,7 @@
 
 from collections import defaultdict
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 from calvin.runtime.north.calvin_token import EOSToken
 
 from calvin.utilities.calvinlogger import get_logger
@@ -40,20 +40,19 @@ class WordCount(Actor):
         self.word_counts = defaultdict(int)
         self.finished = False
 
-    def exception_handler(self, action, args, exceptions):
+    def exception_handler(self, action, args):
         self.finished = True
-        return ActionResult()
 
     @condition(['in'], [])
     def count_word(self, word):
         self.word_counts[word] = self.word_counts[word] + 1
-        return ActionResult()
 
+
+    @stateguard(lambda self: self.finished is True)
     @condition(action_output=['out'])
-    @guard(lambda self: self.finished is True)
     def output_counts(self):
         self.finished = False
-        return ActionResult(production=(self.word_counts,))
+        return (self.word_counts,)
 
     action_priority = (count_word, output_counts)
 

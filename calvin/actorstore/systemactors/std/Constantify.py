@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition
+from calvin.actor.actor import Actor, manage, condition
 
 
 class Constantify(Actor):
@@ -32,7 +32,7 @@ class Constantify(Actor):
 
     @condition(['in'], ['out'])
     def constantify(self, input):
-        return ActionResult(production=(self.constant, ))
+        return (self.constant, )
 
     action_priority = (constantify, )
 

@@ -76,6 +76,7 @@ def main():
 
     log = []
     pid_to_node_id = {}
+    pids = set([])
 
     for file in files:
         for line in file:
@@ -92,7 +93,18 @@ def main():
                                     'func': 'OTHER', 'param': line, 'node_id': None})
                     else:
                         if log:
-                            log[-1]['param'] += line
+                            try:
+                                log[-1]['param'] += line
+                            except:
+                                # Did not have a previous non ANALYZE log line for some reason, skip it
+                                pass
+                    try:
+                        pid = re.match(re_pid, line).group(1)
+                        if pid:
+                            log[-1]['pid'] = pid
+                            pids.add(pid)
+                    except:
+                        pass
                 continue
             try:
                 lineparts = line.split('[[ANALYZE]]',1)
@@ -114,6 +126,8 @@ def main():
 
     pprint.pprint(pid_to_node_id)
     int_pid_to_node_id = {int(k): v for k,v in pid_to_node_id.iteritems()}
+    pids = list(pids)
+    print "PIDS", pids
 
     for l in log:
         if l['node_id'] in int_pid_to_node_id:
@@ -124,12 +138,15 @@ def main():
 
     # Collect all node ids and remove "TESTRUN" string as node id since it is used when logging py.test name
     nodes = list(set([l['node_id'] for l in log] + [l.get('peer_node_id', None)  for l in log]) - set([None, "TESTRUN"]))
+    if not nodes:
+        nodes = pids
+        pid_to_node_id = {p: p for p in pids}
     if args.first in nodes:
         nodes.remove(args.first)
         nodes.insert(0, args.first)
     line = ""
     for n in nodes:
-        line += str(n) + " "*(WIDTH-35)
+        line += str(n) + " "*(WIDTH-len(n))
     print line
     for l in log:
         if 'match_exclude' in l:
@@ -145,7 +162,10 @@ def main():
             continue
         if l['func'] == "OTHER" and l['node_id'] is None:
             try:
-                ind = nodes.index(pid_to_node_id[re.match(re_pid, l['param']).group(1)])*WIDTH
+                if 'pid' in l:
+                    ind = nodes.index(pid_to_node_id[l['pid']])*WIDTH
+                else:
+                    ind = nodes.index(pid_to_node_id[re.match(re_pid, l['param']).group(1)])*WIDTH
             except Exception as e:
                 ind = 0
                 pass

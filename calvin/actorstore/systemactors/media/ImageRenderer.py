@@ -14,7 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, condition, manage
+from calvin.utilities.calvinlogger import get_actor_logger
+from calvin.actor.actor import Actor, condition, manage
+
+_log = get_actor_logger(__name__)
 
 
 class ImageRenderer(Actor):
@@ -50,7 +53,6 @@ class ImageRenderer(Actor):
     def render_image(self, image):
         if image is not None:
             self.image.show_image(self['base64'].b64decode(image), self.width, self.height)
-        return ActionResult(production=())
 
     action_priority = (render_image, )
     requires =  ['calvinsys.media.image', 'calvinsys.native.python-base64']

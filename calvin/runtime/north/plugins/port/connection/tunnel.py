@@ -16,11 +16,13 @@
 
 from calvin.utilities.calvin_callback import CalvinCB
 from calvin.runtime.north.plugins.port import endpoint
+from calvin.runtime.north.calvin_token import Token
 from calvin.runtime.north.calvin_proto import CalvinTunnel
 from calvin.runtime.north.plugins.port import queue
 import calvin.requests.calvinresponse as response
 from calvin.utilities import calvinlogger
 from calvin.runtime.north.plugins.port.connection.common import BaseConnection, PURPOSE
+from calvin.runtime.north.plugins.port import DISCONNECT
 
 _log = calvinlogger.get_logger(__name__)
 
@@ -28,15 +30,21 @@ _log = calvinlogger.get_logger(__name__)
 class TunnelConnection(BaseConnection):
     """ Connect two ports that are remote over a Tunnel"""
 
-    def __init__(self, node, purpose, port, peer_port_meta, callback, **kwargs):
-        super(TunnelConnection, self).__init__(node, purpose, port, peer_port_meta, callback)
+    def __init__(self, node, purpose, port, peer_port_meta, callback, factory, **kwargs):
+        super(TunnelConnection, self).__init__(node, purpose, port, peer_port_meta, callback, factory)
         self.kwargs = kwargs
         if self.purpose != PURPOSE.INIT:
             self.token_tunnel = self.node.pm.connections_data[self.__class__.__name__]
 
     def connect(self, status=None, port_meta=None):
         # TODO: status & port_meta unused
-        
+        if self.peer_port_meta.node_id == self.node.id:
+            # FIXME the factory should provide the verification method instead of a simple node id match
+            # The peer port has moved to this node!
+            # Need ConnectionFactory to redo its job.
+            _log.analyze(self.node.id, "+ TUNNELED-TO-LOCAL", {'factory': self.factory})
+            self.factory.get(self.port, self.peer_port_meta, self.callback).connect()
+            return
         tunnel = None
         if self.peer_port_meta.node_id not in self.token_tunnel.tunnels.iterkeys():
             # No tunnel to peer, get one first
@@ -163,6 +171,12 @@ class TunnelConnection(BaseConnection):
                                      peer_port_id=self.peer_port_meta.port_id)
                 return
 
+        # Update our peer port's properties with newly recieved information
+        if self.peer_port_meta.properties is None:
+            self.peer_port_meta.properties = reply.data.get('port_properties', {})
+        else:
+            self.peer_port_meta.properties.update(reply.data.get('port_properties', {}))
+
         # Set up the port's endpoint
         tunnel = self.token_tunnel.tunnels[self.peer_port_meta.node_id]
         self.port.set_queue(queue.get(self.port, peer_port_meta=self.peer_port_meta))
@@ -171,12 +185,14 @@ class TunnelConnection(BaseConnection):
                                              tunnel,
                                              self.peer_port_meta.node_id,
                                              reply.data['port_id'],
+                                             self.peer_port_meta.properties,
                                              self.node.sched.trigger_loop)
         else:
             endp = endpoint.TunnelOutEndpoint(self.port,
                                               tunnel,
                                               self.peer_port_meta.node_id,
                                               reply.data['port_id'],
+                                              self.peer_port_meta.properties,
                                               self.node.sched.trigger_loop)
         if endp.use_monitor():
             # register into main loop
@@ -219,18 +235,23 @@ class TunnelConnection(BaseConnection):
             _log.analyze(self.node.id, "+ WRONG TUNNEL", payload, peer_node_id=self.peer_port_meta.node_id)
             return response.CalvinResponse(response.GONE)
 
+        self.node.rm.connect_verification(
+            self.port.owner.id, self.port.id, payload['port_id'], self.peer_port_meta.node_id)
+
         self.port.set_queue(queue.get(self.port, peer_port_meta=self.peer_port_meta))
         if self.port.direction == "in":
             endp = endpoint.TunnelInEndpoint(self.port,
                                              tunnel,
                                              self.peer_port_meta.node_id,
                                              self.peer_port_meta.port_id,
+                                             self.peer_port_meta.properties,
                                              self.node.sched.trigger_loop)
         else:
             endp = endpoint.TunnelOutEndpoint(self.port,
                                               tunnel,
                                               self.peer_port_meta.node_id,
                                               self.peer_port_meta.port_id,
+                                              self.peer_port_meta.properties,
                                               self.node.sched.trigger_loop)
         if endp.use_monitor():
             self.node.monitor.register_endpoint(endp)
@@ -246,22 +267,26 @@ class TunnelConnection(BaseConnection):
         self.node.storage.add_port(self.port, self.node.id, self.port.owner.id)
 
         _log.analyze(self.node.id, "+ OK", payload, peer_node_id=self.peer_port_meta.node_id)
-        return response.CalvinResponse(response.OK, {'port_id': self.port.id})
+        return response.CalvinResponse(response.OK, {'port_id': self.port.id, 'port_properties': self.port.properties})
 
-    def disconnect(self):
+    def disconnect(self, terminate=DISCONNECT.TEMPORARY):
         """ Obtain any missing information to enable disconnecting one port peer and make the disconnect"""
 
         _log.analyze(self.node.id, "+", {'port_id': self.port.id})
         # Disconnect and destroy the endpoints
-        self._destroy_endpoints()
+        remaining_tokens = self._destroy_endpoints(terminate=terminate)
+        self._serialize_remaining_tokens(remaining_tokens)
 
+        terminate_peer = DISCONNECT.EXHAUST_PEER if terminate == DISCONNECT.EXHAUST else terminate
         # Inform peer port of disconnection
-        self.node.proto.port_disconnect(callback=CalvinCB(self._disconnected_peer),
+        self.node.proto.port_disconnect(callback=CalvinCB(self._disconnected_peer, terminate=terminate),
                                     port_id=self.port.id,
                                     peer_node_id=self.peer_port_meta.node_id,
-                                    peer_port_id=self.peer_port_meta.port_id)
+                                    peer_port_id=self.peer_port_meta.port_id,
+                                    terminate=terminate_peer,
+                                    remaining_tokens=remaining_tokens)
 
-    def _disconnected_peer(self, reply):
+    def _disconnected_peer(self, reply, terminate=DISCONNECT.TEMPORARY):
         """ Get called for each peer port when diconnecting but callback should only be called once"""
         try:
             # Remove this peer from the list of peer connections
@@ -273,26 +298,58 @@ class TunnelConnection(BaseConnection):
             # parallel connections that we have sent the callback
             self.parallel_set('sent_callback', True)
             if self.callback:
-                self.callback(status=response.CalvinResponse(False), port_id=self.port.id)
+                _log.warning("Disconnect peer tunnel failed %s", str(reply))
+                self.callback(status=reply, port_id=self.port.id)
+                #self.callback(status=response.CalvinResponse(False), port_id=self.port.id)
+            return
+        try:
+            remaining_tokens = reply.data['remaining_tokens']
+            self._deserialize_remaining_tokens(remaining_tokens)
+        except:
+            _log.exception("Did not have remaining_tokens")
+            remaining_tokens = {}
+        self.port.exhausted_tokens(remaining_tokens)
+        if terminate:
+            self.node.storage.add_port(self.port, self.node.id, self.port.owner.id,
+                                        exhausting_peers=remaining_tokens.keys())
         if not getattr(self, 'sent_callback', False) and not self._parallel_connections:
             # Last peer connection we should send OK
             if self.callback:
                 self.callback(status=response.CalvinResponse(True), port_id=self.port.id)
 
-    def disconnection_request(self):
+    def _serialize_remaining_tokens(self, remaining_tokens):
+        for peer_id, tokens in remaining_tokens.items():
+            for token in tokens:
+                token[1] = token[1].encode()
+
+    def _deserialize_remaining_tokens(self, remaining_tokens):
+        for peer_id, tokens in remaining_tokens.items():
+            for token in tokens:
+                token[1] = Token.decode(token[1])
+
+    def disconnection_request(self, terminate=DISCONNECT.TEMPORARY, peer_remaining_tokens=None):
         """ A request from a peer to disconnect a port"""
         # Disconnect and destroy endpoints
-        self._destroy_endpoints()
-        return response.CalvinResponse(True)
+        remaining_tokens = self._destroy_endpoints(terminate=terminate)
+        self._deserialize_remaining_tokens(peer_remaining_tokens)
+        self.port.exhausted_tokens(peer_remaining_tokens)
+        if terminate:
+            self.node.storage.add_port(self.port, self.node.id, self.port.owner.id,
+                                        exhausting_peers=peer_remaining_tokens.keys())
+        self._serialize_remaining_tokens(remaining_tokens)
+        return response.CalvinResponse(True, {'remaining_tokens': remaining_tokens})
 
-    def _destroy_endpoints(self):
-        endpoints = self.port.disconnect(peer_ids=[self.peer_port_meta.port_id])
+    def _destroy_endpoints(self, terminate=DISCONNECT.TEMPORARY):
+        endpoints = self.port.disconnect(peer_ids=[self.peer_port_meta.port_id], terminate=terminate)
         _log.analyze(self.node.id, "+ EP", {'port_id': self.port.id, 'endpoints': endpoints})
-        # Should only be one but maybe future ports will have multiple endpoints for a peer
+        remaining_tokens = {}
+        # Can only be one for the one peer as argument to disconnect, but loop for simplicity
         for ep in endpoints:
+            remaining_tokens.update(ep.remaining_tokens)
             if ep.use_monitor():
                 self.node.monitor.unregister_endpoint(ep)
             ep.destroy()
+        return remaining_tokens
 
     class TokenTunnel(object):
         """ Handles token transport over tunnel, common instance for all token tunnel connections """
@@ -356,11 +413,20 @@ class TunnelConnection(BaseConnection):
             """ Gets called when a token arrives on any port """
             try:
                 port = self._get_local_port(port_id=payload['peer_port_id'])
-                port.endpoint.recv_token(payload)
+                for e in port.endpoints:
+                    # We might have started a disconnect, just ignore in that case
+                    # it is sorted out if we connect again
+                    try:
+                        if e.peer_id == payload['port_id']:
+                            e.recv_token(payload)
+                            break
+                    except:
+                        pass
             except:
                 # Inform other end that it sent token to a port that does not exist on this node or
                 # that we have initiated a disconnect (endpoint does not have recv_token).
                 # Can happen e.g. when the actor and port just migrated and the token was in the air
+                _log.debug("recv_token_handler, ABORT")
                 reply = {'cmd': 'TOKEN_REPLY',
                          'port_id': payload['port_id'],
                          'peer_port_id': payload['peer_port_id'],

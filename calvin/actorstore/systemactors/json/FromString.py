@@ -16,7 +16,7 @@
 
 # encoding: utf-8
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition
+from calvin.actor.actor import Actor, manage, condition
 from calvin.runtime.north.calvin_token import EOSToken, ExceptionToken
 
 
@@ -34,8 +34,8 @@ class FromString(Actor):
       data   : data read from input string
     """
 
-    def exception_handler(self, action, args, context):
-        return ActionResult(production=(self.default,))
+    def exception_handler(self, action, args):
+        return (self.default,)
 
     @manage(['exception_output'])
     def init(self, exception_output=None):
@@ -55,7 +55,7 @@ class FromString(Actor):
             res = self['json'].loads(string)
         except:
             res = self.default
-        return ActionResult(production=(res,))
+        return (res,)
 
     action_priority = (load,)
     require = ['calvinsys.native.python-json']

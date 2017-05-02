@@ -27,9 +27,9 @@ from calvin.runtime.north.plugins.port import queue
 
 def fwrite(port, value):
     if isinstance(value, Token):
-        port.queue.write(value)
+        port.queue.write(value, None)
     else:
-        port.queue.write(Token(value=value))
+        port.queue.write(Token(value=value), None)
 
 
 def pwrite(actor, portname, value):
@@ -52,13 +52,18 @@ def pread(actor, portname, number=1):
     assert port
     if number > 0:
         if not pavailable(actor, portname, number):
-            raise AssertionError("Too few tokens available, %d, expected %d" % (pavailable(actor, portname), number))
+            try:
+                # Dig deep into queue, can break at any time
+                available = port.queue.write_pos - port.queue.tentative_read_pos[next(iter(port.queue.readers))]
+            except:
+                available = -9999
+            raise AssertionError("Too few tokens available, %d, expected %d" % (available, number))
     else:
         if pavailable(actor, portname, number+1):
-            raise AssertionError("Too many tokens available, %d, expected %d" % (pavailable(actor, portname), number))
+            raise AssertionError("Too many tokens available, expected %d" % number)
 
     values = [port.queue.peek(actor.id).value for _ in range(number)]
-    port.queue.commit(actor.id), True
+    port.queue.commit(actor.id)
     return values
 
 
@@ -178,27 +183,31 @@ class CalvinSysFileMock(object):
         fdmock.close()
 
 
-def load_python_requirement(req):
+
+def load_simple_requirement(req):
+    # For 'simple' requirements with no external dependencies,
     import importlib
-    loaded = importlib.import_module("calvin.calvinsys.native." + req)
-    return loaded.register
+    loaded = importlib.import_module("calvin." + req)
+    return loaded.register()
 
 requirements = \
     {
-        'calvinsys.io.filehandler': CalvinSysFileMock,
-        'calvinsys.events.timer': CalvinSysTimerMock,
-        'calvinsys.native.python-os-path': load_python_requirement('python-os-path'),
-        'calvinsys.native.python-re': load_python_requirement('python-re'),
-        'calvinsys.native.python-json': load_python_requirement('python-json'),
-        'calvinsys.native.python-copy': load_python_requirement('python-copy'),
-        'calvinsys.native.python-base64': load_python_requirement('python-base64')
-
+        'calvinsys.io.filehandler': CalvinSysFileMock(),
+        'calvinsys.events.timer': CalvinSysTimerMock()
     }
 
 
 class CalvinSysMock(dict):
     def use_requirement(self, actor, requirement):
-        return requirements[requirement]()
+        print actor
+        if requirement in requirements:
+            return requirements[requirement]
+        elif requirement.startswith("calvinsys.native"):
+            return load_simple_requirement(requirement)
+        elif requirement.startswith("calvinsys.math"):
+            return load_simple_requirement(requirement)
+        else:
+            raise Exception("Test framework does not know how to handle requirement '%s'" % (requirement,))
 
 
 class ActorTester(object):
@@ -237,12 +246,12 @@ class ActorTester(object):
             raise e
 
         for inport in actor.inports.values():
-            inport.set_queue(queue.fanout_fifo.FanoutFIFO(5))
+            inport.set_queue(queue.fanout_fifo.FanoutFIFO({'queue_length': 100, 'direction': "in"}, {}))
             inport.endpoint = DummyInEndpoint(inport)
-            inport.queue.add_reader(inport.id)
+            inport.queue.add_reader(inport.id, {})
         for outport in actor.outports.values():
-            outport.set_queue(queue.fanout_fifo.FanoutFIFO(5))
-            outport.queue.add_reader(actor.id)
+            outport.set_queue(queue.fanout_fifo.FanoutFIFO({'queue_length': 100, 'direction': "out"}, {}))
+            outport.queue.add_reader(actor.id, {})
             outport.endpoints.append(DummyOutEndpoint(outport))
 
         self.actors[actorname] = actor
@@ -289,7 +298,11 @@ class ActorTester(object):
             for port, values in outputs.iteritems():
                 try:
                     vals = pread(aut, port, len(values))
-                    assert vals == values, "Expected output '%s' does not match '%s'" % (vals, values)
+                    if type(values) is set:
+                        # disregard order
+                        assert set(vals) == values, "Expected output set '%s' does not match '%s'" % (set(vals), values)
+                    else:
+                        assert vals == values, "Expected output '%s' does not match '%s'" % (vals, values)
                 except AssertionError as e:
                     print "Error:", str(e)
                     raise AssertionError("Failed test %d" % (test_index,))

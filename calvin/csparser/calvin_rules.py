@@ -19,7 +19,7 @@ import ply.lex as lex
 # Make sure we have an initial value for zerocol
 lex.Lexer.zerocol = 0
 
-keywords = {'component': 'COMPONENT', 'define': 'DEFINE', 'voidport': 'VOID'}
+keywords = {x:x.upper() for x in ['component', 'define', 'voidport', 'rule', 'group', 'apply']}
 
 tokens = [
     'IDENTIFIER', 'STRING', 'NUMBER',
@@ -28,7 +28,8 @@ tokens = [
     'LBRACK', 'RBRACK',
     'DOT', 'COMMA', 'COLON',
     'GT', 'EQ',
-    'RARROW',
+    'AND', 'OR', 'NOT', 'STAR',
+    'RARROW', 'SLASH',
     'DOCSTRING',
     'FALSE', 'TRUE', 'NULL'
 
@@ -46,6 +47,12 @@ t_COLON = r':'
 t_GT = r'>'
 t_EQ = r'='
 t_RARROW = r'->'
+t_SLASH = r'/'
+t_AND = r'&'
+t_OR = r'\|'
+t_NOT = r'~'
+t_STAR = r'\*'
+
 # t_FALSE = r'false'
 # t_TRUE = r'true'
 # t_NULL = r'null'
@@ -64,16 +71,19 @@ def t_DOCSTRING(t):
     t.value = t.value.strip(' \n\t')
     return t
 
-# FIXME: Strings need a better definition
+# String allows escaping of any character
+# Multiline strings are not allowed, but
+# parser will concatenate sequential strings
+# separated by any number/kind of whitespace.
 def t_STRING(t):
-    r'!?".*?"'
+    r'!?"([^"\\\n]|(\\.))*?"'
     is_raw = False
     if t.value.startswith('!'):
         # Keep as raw string
         is_raw = True
         t.value = t.value[1:]
     # Remove the double quotes
-    t.value = t.value.strip('"')
+    t.value = t.value[1:-1]
     if not is_raw:
         t.value = t.value.decode('string_escape')
     return t

@@ -23,43 +23,43 @@ _log = calvinlogger.get_logger(__name__)
 
 
 class CalvinTransportFactory(base_transport.BaseTransportFactory):
-
-    def __init__(self, rt_id, callbacks):
+    def __init__(self, rt_id, node_name, callbacks):
         super(CalvinTransportFactory, self).__init__(rt_id, callbacks=callbacks)
+        self._node_name = node_name
         self._peers = {}
         self._servers = {}
         self._callbacks = callbacks
+        self._client_validator = None
 
-    def _peer_connected(self):
-        pass
-
-    def join(self, uri):
+    def join(self, uri, server_node_name=None):
         """docstring for join"""
         schema, peer_addr = uri.split(':', 1)
         if schema != 'calvinip':
             raise Exception("Cant handle schema %s!!" % schema)
-
+        _log.debug("calvinip join %s", uri)
         try:
-            tp = twisted_transport.CalvinTransport(self._rt_id, uri, self._callbacks,
-                                                   TwistedCalvinTransport)
+            tp = twisted_transport.CalvinTransport(self._rt_id,
+                                                    uri, self._callbacks,
+                                                    TwistedCalvinTransport,
+                                                    node_name=self._node_name,
+                                                    client_validator=self._client_validator,
+                                                    server_node_name=server_node_name)
             self._peers[peer_addr] = tp
             tp.connect()
-            # self._callback_execute('join_finished', peer_id, tp)
-            return True
+            return tp
         except:
             _log.exception("Error creating TwistedCalvinTransport")
             raise
 
-    def listen(self, uri):
-        if uri == "calvinip:default":
+    def _get_uri(self, uri):
+        if uri == "calvinip://default":
             # Need to form a proper default uri
-            try:
-                portnbrs = [int(urit.split(':')[-1]) for urit in self._servers.keys()]
-                port = max(portnbrs) + 1 if portnbrs else 50000
-            except:
-                port = 50000
-            uri = "calvinip:0.0.0.0:" + str(port)
+            uri = "calvinip://0.0.0.0"
+        return uri
 
+    def listen(self, uri):
+        _log.debug("Listen incoming uri %s", uri)
+        uri = self._get_uri(uri)
         schema, _peer_addr = uri.split(':', 1)
         if schema != 'calvinip':
             raise Exception("Cant handle schema %s!!" % schema)
@@ -69,9 +69,19 @@ class CalvinTransportFactory(base_transport.BaseTransportFactory):
 
         try:
             tp = twisted_transport.CalvinServer(
-                self._rt_id, uri, self._callbacks, TwistedCalvinServer, TwistedCalvinTransport)
+                self._rt_id, self._node_name, uri, self._callbacks, TwistedCalvinServer, TwistedCalvinTransport,
+                client_validator=self._client_validator)
+            port = tp.start()
+            _log.debug("Listen real uri %s", uri)
             self._servers[uri] = tp
-            tp.start()
+            return tp
         except:
             _log.exception("Error starting server")
             raise
+
+    def stop_listening(self, uri):
+        _log.debug("Stop listnening %s", uri)
+        uri = self._get_uri(uri)
+        if uri in self._servers:
+            server = self._servers.pop(uri)
+            server.stop()

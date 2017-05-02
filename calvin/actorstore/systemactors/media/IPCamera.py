@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 from calvin.utilities.calvinlogger import get_logger
 
 _log = get_logger(__name__)
@@ -50,7 +50,7 @@ class IPCamera(Actor):
         # self.credentials = {"username": "root", "password": "pass"}
         self.ip = self['attr'].get("/media/ip_camera/ip").encode('utf8')
         self.credentials = {
-            "username": self['attr'].get("/media/ip_camera/username"), 
+            "username": self['attr'].get("/media/ip_camera/username"),
             "password": self['attr'].get("/media/ip_camera/password")
         }
 
@@ -59,37 +59,38 @@ class IPCamera(Actor):
         if self.request:
             self['http'].finalize(self.request)
             self.request = None
-        
-    @condition(action_input=['trigger'])
-    @guard(lambda self, trigger: self.ip and self.credentials and self.request is None and trigger)
-    def new_request(self, trigger):
-        url = "http://" + self.ip + "/axis-cgi/jpg/image.cgi"
-        auth = "Basic " + self['base64'].b64encode("%s:%s" % (self.credentials['username'], self.credentials['password']))
-        header = {'Authorization': auth}
-        params = {}
-        self.request = self['http'].get(url, params, header)
-        return ActionResult()
 
+    @stateguard(lambda self: self.ip and self.credentials and self.request is None)
+    @condition(action_input=['trigger'])
+    def new_request(self, trigger):
+        if trigger:
+            url = "http://" + self.ip + "/axis-cgi/jpg/image.cgi"
+            auth = "Basic " + self['base64'].b64encode("%s:%s" % (self.credentials['username'], self.credentials['password']))
+            header = {'Authorization': auth}
+            params = {}
+            self.request = self['http'].get(url, params, header)
+        
+
+    @stateguard(lambda self: self.request and not self.received_status and self['http'].received_headers(self.request))
     @condition(action_output=['status'])
-    @guard(lambda self: self.request and not self.received_status and self['http'].received_headers(self.request))
     def handle_headers(self):
         status = self['http'].status(self.request)
         self.received_status = status
-        return ActionResult(production=(status,))
+        return (status,)
 
+    @stateguard(lambda self: self.request and self.received_status == 200 and self['http'].received_body(self.request))
     @condition(action_output=['image'])
-    @guard(lambda self: self.request and self.received_status == 200 and self['http'].received_body(self.request))
     def handle_body(self):
         body = self['http'].body(self.request)
         image = self['base64'].b64encode(body)
         self.reset_request()
-        return ActionResult(production=(image,))
+        return (image,)
 
+    @stateguard(lambda self: self.request and self.received_status and self.received_status != 200)
     @condition()
-    @guard(lambda self: self.request and self.received_status and self.received_status != 200)
     def handle_empty_body(self):
         self.reset_request()
-        return ActionResult()
+        
 
     action_priority = (handle_body, handle_empty_body, handle_headers, new_request)
     requires = ['calvinsys.network.httpclienthandler', 'calvinsys.native.python-base64', "calvinsys.attribute.private"]

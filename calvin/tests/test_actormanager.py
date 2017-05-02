@@ -31,6 +31,7 @@ class ActorManagerTests(unittest.TestCase):
         n = DummyNode()
         self.am = ActorManager(node=n)
         n.am = self.am
+        n.pm.remove_ports_of_actor = Mock(return_value = [])
 
     def tearDown(self):
         pass
@@ -56,8 +57,7 @@ class ActorManagerTests(unittest.TestCase):
         s = a.state()
 
         self.assertEqual(s['data'], data)
-        self.assertEqual(s['id'], a_id)
-        self.assertEqual(s['n'], 1)
+        self.assertEqual(s['_id'], a_id)
 
     def test_new_actor_from_state(self):
         # Test basic actor state manipulation
@@ -65,7 +65,6 @@ class ActorManagerTests(unittest.TestCase):
         data = 42
         a, a_id = self._new_actor(a_type, {'data':data})
         a.data = 43
-        a.n = 2
         s = a.state()
         self.am.destroy(a_id)
         self.assertEqual(len(self.am.actors), 0)
@@ -73,7 +72,6 @@ class ActorManagerTests(unittest.TestCase):
         b, b_id = self._new_actor(a_type, None, state = s)
 
         self.assertEqual(a.data, 43)
-        self.assertEqual(a.n, 2)
         # Assert id is preserved
         self.assertEqual(a.id, a_id)
         # Assert actor database is consistent
@@ -89,7 +87,7 @@ class ActorManagerTests(unittest.TestCase):
 
         assert actor_id not in self.am.actors
         remove_actor_info.assert_called_with(actor_id)
-        self.am.node.storage.delete_actor.assert_called_with(actor_id)
+        assert self.am.node.storage.delete_actor.call_args[0][0] == actor_id
         self.am.node.control.log_actor_destroy.assert_called_with(actor_id)
 
     def test_enable_actor(self):
@@ -129,7 +127,7 @@ class ActorManagerTests(unittest.TestCase):
         callback_mock = Mock()
 
         actor, actor_id = self._new_actor('std.Constant', {'data': 42})
-        actor.outports['token'].set_queue(queue.fanout_fifo.FanoutFIFO(5))
+        actor.outports['token'].set_queue(queue.fanout_fifo.FanoutFIFO({'queue_length': 4, 'direction': "out"}, {}))
         peer_node = DummyNode()
 
         actor.will_migrate = Mock()
@@ -171,7 +169,7 @@ class ActorManagerTests(unittest.TestCase):
 
     def test_connections_returns_actor_connections_for_current_node(self):
         actor, actor_id = self._new_actor('std.Constant', {'data': 42, 'name': 'actor'})
-        actor.outports['token'].set_queue(queue.fanout_fifo.FanoutFIFO(5))
+        actor.outports['token'].set_queue(queue.fanout_fifo.FanoutFIFO({'queue_length': 4, 'direction': "out"}, {}))
         expected = {
             'actor_name': 'actor',
             'actor_id': actor_id,
@@ -181,7 +179,7 @@ class ActorManagerTests(unittest.TestCase):
         self.assertEqual(self.am.connections(actor_id), expected)
 
     def test_missing_actor(self):
-        test_functions = [("report", ()), ("destroy", ()), ("enable", ()), ("disable", ()),
+        test_functions = [("report", ({},)), ("destroy", ()), ("enable", ()), ("disable", ()),
                           ("connect", ([], None)), ("connections", ()), ("dump", ()),
                           ("get_port_state", (None, ))]
         for func, args in test_functions:

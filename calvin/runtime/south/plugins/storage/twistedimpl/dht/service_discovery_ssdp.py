@@ -41,21 +41,44 @@ SERVER_ID = ','.join([platform.system(),
                       platform.release(),
                       'UPnP/1.0,Calvin UPnP framework',
                       __version__])
-SERVICE_UUID = '1693326a-abb9-11e4-8dfb-9cb654a16426'
 
-MS =    ('M-SEARCH * HTTP/1.1\r\nHOST: %s:%d\r\nMAN: "ssdp:discover"\r\n' +
+SERVICE_UUID = '1693326a-abb9-11e4-8dfb-9cb654a16426'
+CA_SERVICE_UUID = '58532fde-e793-11e5-965d-7cd1c3da1305'
+
+MS_BOOTSTRAP =    ('M-SEARCH * HTTP/1.1\r\nHOST: %s:%d\r\nMAN: "ssdp:discover"\r\n' +
          'MX: 2\r\nST: uuid:%s\r\n\r\n') %\
         (SSDP_ADDR, SSDP_PORT, SERVICE_UUID)
 
-MS_RESP =   'HTTP/1.1 200 OK\r\n' + \
+MS_CA = ('M-SEARCH * HTTP/1.1\r\nHOST: %s:%d\r\nMAN: "ssdp:discover"\r\n' +
+         'MX: 2\r\nST: uuid:%s\r\n\r\n') %\
+        (SSDP_ADDR, SSDP_PORT, CA_SERVICE_UUID)
+
+MS = {SERVICE_UUID: MS_BOOTSTRAP, CA_SERVICE_UUID: MS_CA}
+
+MS_BOOTSTRAP_RESP = 'HTTP/1.1 200 OK\r\n' + \
             'USN: %s::upnp:rootdevice\r\n' % SERVICE_UUID + \
-            'SERVER: %s\r\nlast-seen: %s\r\nEXT: \r\nSERVICE: %s\r\n' + \
-            'LOCATION: http://calvin@github.se/%s/description-0.0.1.xml\r\n' % SERVICE_UUID + \
-            'CACHE-CONTROL: max-age=1800\r\nST: uuid:%s\r\n' % SERVICE_UUID + \
+            'SERVER: %s\r\n' + \
+            'last-seen: %s\r\n' + \
+            'EXT: \r\n' + \
+            'SERVICE: %s\r\n' + \
+            'LOCATION: %s\r\n' + \
+            'CACHE-CONTROL: max-age=1800\r\n' + \
+            'ST: uuid:%s\r\n' % SERVICE_UUID + \
             'DATE: %s\r\n'
 
-def parse_http_response(data):
+MS_CA_RESP = 'HTTP/1.1 200 OK\r\n' + \
+            'USN: %s::upnp:rootdevice\r\n' % CA_SERVICE_UUID + \
+            'SERVER: %s\r\n' + \
+            'last-seen: %s\r\n' + \
+            'EXT: \r\n' + \
+            'LOCATION: %s\r\n' + \
+            'CACHE-CONTROL: max-age=1800\r\n' + \
+            'ST: uuid:%s\r\n' % CA_SERVICE_UUID + \
+            'DATE: %s\r\n'
 
+MS_RESP = {SERVICE_UUID: MS_BOOTSTRAP_RESP, CA_SERVICE_UUID: MS_CA_RESP}
+
+def parse_http_response(data):
     """ don't try to get the body, there are reponses without """
     header = data.split('\r\n\r\n')[0]
 
@@ -71,12 +94,14 @@ def parse_http_response(data):
 
 
 class ServerBase(DatagramProtocol):
-    def __init__(self, ips, cert=None, d=None):
+    def __init__(self, node_id, control_uri, ips, d=None):
         self._services = {}
         self._dstarted = d
         self.ignore_list = []
         self.ips = ips
-        self.cert = cert
+        self._msearches_resp = {sid: {} for sid in MS.keys()}
+        self._node_id = node_id
+        self._control_uri = control_uri
 
     def startProtocol(self):
         if self._dstarted:
@@ -86,7 +111,7 @@ class ServerBase(DatagramProtocol):
         # Broadcast
         try:
             cmd, headers = parse_http_response(datagram)
-            _log.debug("Received %s, %s from %r" % (cmd, headers, address, ))
+            _log.debug("ServerBase::Received %s, %s from %r" % (cmd, headers, address, ))
 
             if cmd[0] == 'M-SEARCH' and cmd[1] == '*':
 
@@ -100,19 +125,22 @@ class ServerBase(DatagramProtocol):
                             if addr[0] == "127.0.0.1" and address[0] != "127.0.0.1":
                                 continue
 
-                            response = MS_RESP % ('%s:%d' % addr, str(time.time()),
-                                                  k, datetimeToString())
-                            if self.cert != None:
-                                response = "{}CERTIFICATE: ".format(response)
-                                response = "{}{}".format(response, self.cert)
-                            response = "{}\r\n\r\n".format(response)
-
-                            _log.debug("Sending response: %s" % repr(response))
+                            response = MS_RESP[SERVICE_UUID] % ('%s:%d' % addr, str(time.time()),
+                                                                k, self._control_uri + "/node/" + self._node_id, datetimeToString())
+                            if "cert" in self._msearches_resp[SERVICE_UUID].keys():
+                                response += "CERTIFICATE: {}\r\n\r\n".format(self._msearches_resp[SERVICE_UUID]["cert"])
+                            _log.debug("ServerBase::Sending response: %s" % repr(response))
                             delay = random.randint(0, min(5, int(headers['mx'])))
                             reactor.callLater(delay, self.send_it,
                                                   response, address)
+                elif CA_SERVICE_UUID in headers['st'] and address not in self.ignore_list\
+                    and self._msearches_resp[CA_SERVICE_UUID]["sign"]:
+                    _log.error("CA signing via SSDP no longer supported")
         except:
             _log.exception("Error datagram received")
+
+    def update_params(self, service_uuid, **kwargs):
+        self._msearches_resp[service_uuid].update(kwargs)
 
     def add_service(self, service, ip, port):
         # Service on all interfaces
@@ -164,7 +192,7 @@ class ClientBase(DatagramProtocol):
 
         if cmd[0].startswith('HTTP/1.') and cmd[1] == '200':
 
-            _log.debug("Received %s from %r" % (headers, address, ))
+            _log.debug("ClientBase::Received %s from %r" % (headers, address, ))
             if SERVICE_UUID in headers['st']:
                 c_address = headers['server'].split(':')
                 c_address[1] = int(c_address[1])
@@ -177,7 +205,7 @@ class ClientBase(DatagramProtocol):
                 if self._service is None or \
                    self._service == headers['service']:
 
-                    _log.debug("Received service %s from %s" %
+                    _log.debug("ClientBase::Received service %s from %s" %
                                (headers['service'], c_address, ))
 
                     if c_address:
@@ -203,7 +231,7 @@ class ClientBase(DatagramProtocol):
 
 
 class SSDPServiceDiscovery(ServiceDiscoveryBase):
-    def __init__(self, iface='', cert=None, ignore_self=True):
+    def __init__(self, node_id, control_uri, iface='', ignore_self=True):
         super(SSDPServiceDiscovery, self).__init__()
 
         self.ignore_self = ignore_self
@@ -212,7 +240,8 @@ class SSDPServiceDiscovery(ServiceDiscoveryBase):
         self.port = None
         self._backoff = .2
         self.iface_send_list = []
-        self.cert = cert
+        self._node_id = node_id
+        self._control_uri = control_uri
 
         if self.iface in ["0.0.0.0", ""]:
             for a in netifaces.interfaces():
@@ -228,7 +257,11 @@ class SSDPServiceDiscovery(ServiceDiscoveryBase):
         dserver = defer.Deferred()
         dclient = defer.Deferred()
         try:
-            self.ssdp = reactor.listenMulticast(SSDP_PORT, ServerBase(self.iface_send_list, cert=self.cert, d=dserver),
+            self.ssdp = reactor.listenMulticast(SSDP_PORT,
+                                                ServerBase(self._node_id,
+                                                           self._control_uri,
+                                                           self.iface_send_list,
+                                                           d=dserver),
                                                 listenMultiple=True)
             self.ssdp.setTTL(5)
             for iface_ in self.iface_send_list:
@@ -248,6 +281,9 @@ class SSDPServiceDiscovery(ServiceDiscoveryBase):
             self.ssdp.protocol.set_ignore_list([(x, self.port.getHost().port) for x in self.iface_send_list])
 
         return dserver, dclient
+
+    def update_server_params(self, service_uuid, **kwargs):
+        self.ssdp.protocol.update_params(service_uuid, **kwargs)
 
     def start_search(self, callback=None, stop=False):
 
@@ -279,7 +315,7 @@ class SSDPServiceDiscovery(ServiceDiscoveryBase):
             for src_ip in self.iface_send_list:
                 self.port.protocol.transport.setOutgoingInterface(src_ip)
                 _log.debug("Sending  M-SEARCH... on %s", src_ip)
-                self.port.write(MS, (SSDP_ADDR, SSDP_PORT))
+                self.port.write(MS[SERVICE_UUID], (SSDP_ADDR, SSDP_PORT))
 
             if not once and not self.port.protocol.is_stopped():
                 reactor.callLater(self._backoff, self._send_msearch, once=False)

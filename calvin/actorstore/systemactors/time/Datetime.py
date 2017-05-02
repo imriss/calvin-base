@@ -1,4 +1,4 @@
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 
 class Datetime(Actor):
     """
@@ -26,7 +26,7 @@ class Datetime(Actor):
 
     @condition(['trigger'], ['datetime'])
     def action(self, consume_trigger):
-        return ActionResult(production=(self['time'].datetime(),))
+        return (self['time'].datetime(),)
 
     action_priority = (action,)
     requires = ['calvinsys.native.python-time']

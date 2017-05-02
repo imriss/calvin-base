@@ -14,14 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition
+from calvin.actor.actor import Actor, manage, condition
 
 
 class Temperature(Actor):
 
     """
-        Read temperature when told to
-        
+    Read temperature when told to
+
     Inputs:
         measure: Triggers a temperature reading
     Outputs:
@@ -34,17 +34,17 @@ class Temperature(Actor):
 
     def setup(self):
         self.use("calvinsys.sensors.environmental", shorthand="temp")
-        
+
     def will_migrate(self):
         pass
-        
+
     def did_migrate(self):
         self.setup()
-    
+
     @condition(['measure'], ['centigrade'])
     def measure(self, _):
         temperature = self['temp'].get_temperature()
-        return ActionResult(production=(temperature,))
+        return (temperature,)
 
     action_priority = (measure,)
     requires =  ['calvinsys.sensors.environmental']

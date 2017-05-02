@@ -15,6 +15,9 @@
 # limitations under the License.
 
 import numbers
+from calvin.utilities import calvinlogger
+
+_log = calvinlogger.get_logger(__name__)
 
 RESPONSE_CODES = {
     # Information
@@ -84,12 +87,15 @@ class CalvinResponseException(Exception):
         super(CalvinResponseException, self).__init__()
         self.response = response
 
+    @property
     def status(self):
         return self.response.status
 
+    @property
     def data(self):
         return self.response.data
 
+    @property
     def success_list(self):
         return self.response.success_list
 
@@ -174,6 +180,11 @@ class CalvinResponse(object):
     def set_status(self, status):
         if isinstance(status, bool):
             status = 200 if status else 500
+        if status == 500 or status == 404:
+            _log.debug("Setting failure status %s on CalvinResponse", status)
+            # For debuging!!
+            # import traceback
+            # traceback.print_stack(limit=10)
         self.status = status
 
     def encode(self):

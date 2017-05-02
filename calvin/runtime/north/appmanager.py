@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import os
+import copy
 from calvin.utilities.calvin_callback import CalvinCB
 from calvin.utilities import dynops
 from calvin.utilities import calvinlogger
@@ -24,6 +25,7 @@ from calvin.utilities import calvinuuid
 from calvin.actorstore.store import ActorStore, GlobalStore
 from calvin.runtime.south.plugins.async import async
 from calvin.utilities.security import Security
+from calvin.utilities.requirement_matching import ReqMatch
 
 _log = calvinlogger.get_logger(__name__)
 
@@ -169,7 +171,7 @@ class AppManager(object):
         elif cb:
             cb(status=response.CalvinResponse(True))
 
-    def destroy(self, application_id, cb=None):
+    def destroy(self, application_id, cb):
         """ Destroy an application and its actors """
         _log.analyze(self._node.id, "+", {'application_id': application_id})
         if application_id in self.applications:
@@ -177,16 +179,17 @@ class AppManager(object):
         else:
             self.storage.get_application(application_id, CalvinCB(self._destroy_app_info_cb, cb=cb))
 
-    def _destroy_app_info_cb(self, application_id, value, cb=None):
+    def _destroy_app_info_cb(self, key, value, cb):
+        application_id = key
         _log.analyze(self._node.id, "+", {'application_id': application_id, 'value': value})
-        _log.debug("Destroy app info %s: %s" % application_id, value)
+        _log.debug("Destroy app info %s: %s" % (application_id, value))
         if value:
             self._destroy(Application(application_id, value['name'], value['origin_node_id'],
-                                      self._node.am, value['actors_name_map']))
+                                      self._node.am, value['actors_name_map']), cb=cb)
         elif cb:
             cb(status=response.CalvinResponse(response.NOT_FOUND))
 
-    def _destroy(self, application, cb=None):
+    def _destroy(self, application, cb):
         _log.analyze(self._node.id, "+", {'actors': application.actors})
         application.destroy_cb = cb
         try:
@@ -194,39 +197,75 @@ class AppManager(object):
         except:
             pass
         application.clear_node_info()
-        # Loop over copy of app's actors, since modified inside loop
-        for actor_id in application.actors.keys()[:]:
+        application.actor_replicas = []
+        application.replication_ids = []
+        for actor_id in application.actors.keys():
             if actor_id in self._node.am.list_actors():
-                _log.analyze(self._node.id, "+ LOCAL ACTOR", {'actor_id': actor_id})
-                # TODO: Check if it went ok
-                self._node.am.destroy(actor_id)
-                application.remove_actor(actor_id)
+                # TODO fix this if master can switch from original actor
+                replicas = self._node.am.actors[actor_id]._replication_data.get_replicas(actor_id)
+                _log.analyze(self._node.id, "+ LOCAL ACTOR", {'actor_id': actor_id, 'replicas': replicas})
+                application.actor_replicas.extend(replicas)
+                application.update_node_info(self._node.id, actor_id)
             else:
                 _log.analyze(self._node.id, "+ REMOTE ACTOR", {'actor_id': actor_id})
                 self.storage.get_actor(actor_id, CalvinCB(func=self._destroy_actor_cb, application=application))
 
-        if not application.actors or application.complete_node_info():
-            # Actors list already empty, all actors were local or the storage was calling the cb in-loop
-            _log.analyze(self._node.id, "+ DONE", {})
+        _log.analyze(self._node.id, "+ LOCAL REPLICAS", {'replicas': application.actor_replicas})
+        for actor_id in application.actor_replicas[:]:
+            application.actors[actor_id] = "noname"
+            application.actor_replicas.remove(actor_id)
+            if actor_id in self._node.am.list_actors():
+                application.update_node_info(self._node.id, actor_id)
+            else:
+                self.storage.get_actor(actor_id,
+                    CalvinCB(func=self._destroy_actor_cb, application=application, check_replica=False))
+
+        if application.complete_node_info() and not application.replication_ids and not application.actor_replicas:
+            # All actors were local
+            _log.analyze(self._node.id, "+ DONE", {'actors': application.actors, 'replicas': application.actor_replicas})
             self._destroy_final(application)
 
-    def _destroy_actor_cb(self, key, value, application, retries=0):
+    def _destroy_actor_cb(self, key, value, application, retries=0, check_replica=True):
         """ Get actor callback """
-        _log.analyze(self._node.id, "+", {'actor_id': key, 'value': value, 'retries': retries})
-        _log.debug("Destroy app peers actor cb %s" % key)
+        _log.analyze(self._node.id, "+", {'actor_id': key, 'value': value, 'retries': retries,
+                                        'check_replica': check_replica})
+        _log.debug("Destroy app peers actor cb %s - retry: %d\n%s" % (key, retries, str(value)))
         if value and 'node_id' in value:
             application.update_node_info(value['node_id'], key)
+            if 'replication_id' in value and check_replica:
+                application.replication_ids.append(value['replication_id'])
+                self.storage.get_replica(value['replication_id'],
+                    cb=CalvinCB(func=self._replicas_cb, replication_id=value['replication_id'], master_id=key,
+                                application=application))
         else:
             if retries<10:
                 # FIXME add backoff time
                 _log.analyze(self._node.id, "+ RETRY", {'actor_id': key, 'value': value, 'retries': retries})
-                self.storage.get_actor(key, CalvinCB(func=self._destroy_actor_cb, application=application, retries=(retries+1)))
+                self.storage.get_actor(key, CalvinCB(func=self._destroy_actor_cb, application=application, retries=(retries+1), check_replica=check_replica))
             else:
                 # FIXME report failure
                 _log.analyze(self._node.id, "+ GIVE UP", {'actor_id': key, 'value': value, 'retries': retries})
                 application.update_node_info(None, key)
 
-        if application.complete_node_info():
+        if application.complete_node_info() and not application.replication_ids and not application.actor_replicas:
+            self._destroy_final(application)
+
+    def _replicas_cb(self, key, value, replication_id, master_id, application):
+        application.replication_ids.remove(replication_id)
+        if isinstance(value, (list, tuple, set)):
+            application.actor_replicas.extend(value)
+        for actor_id in application.actor_replicas[:]:
+            if actor_id == master_id:
+                application.actor_replicas.remove(actor_id)
+                continue
+            application.actors[actor_id] = "noname"
+            application.actor_replicas.remove(actor_id)
+            if actor_id in self._node.am.list_actors():
+                application.update_node_info(self._node.id, actor_id)
+            else:
+                self.storage.get_actor(actor_id,
+                    CalvinCB(func=self._destroy_actor_cb, application=application, check_replica=False))
+        if application.complete_node_info() and not application.replication_ids:
             self._destroy_final(application)
 
     def _destroy_final(self, application):
@@ -239,7 +278,18 @@ class AppManager(object):
         for node_id, actor_ids in application.node_info.iteritems():
             if not node_id:
                 _log.analyze(self._node.id, "+ UNKNOWN NODE", {})
-                application._destroy_node_ids[None] = response.CalvinResponse(False)
+                application._destroy_node_ids[None] = response.CalvinResponse(False, data=actor_ids)
+                continue
+            if node_id == self._node.id:
+                ok = True
+                for actor_id in actor_ids:
+                    if actor_id in self._node.am.list_actors():
+                        _log.analyze(self._node.id, "+ LOCAL ACTOR", {'actor_id': actor_id})
+                        try:
+                            self._node.am.destroy(actor_id)
+                        except:
+                            ok = False
+                application._destroy_node_ids[node_id] = response.CalvinResponse(ok)
                 continue
             # Inform peers to destroy their part of the application
             self._node.proto.app_destroy(node_id, CalvinCB(self._destroy_final_cb, application, node_id),
@@ -261,10 +311,16 @@ class AppManager(object):
         if any([s is None for s in application._destroy_node_ids.values()]):
             return
         # Done
+        
         if all(application._destroy_node_ids.values()):
             application.destroy_cb(status=response.CalvinResponse(True))
         else:
-            application.destroy_cb(status=response.CalvinResponse(False))
+            # Missing is the actors that could not be found.
+            # FIXME retry? They could have moved
+            missing = []
+            for status in application._destroy_node_ids.values():
+                missing += [] if status.data is None else status.data
+            application.destroy_cb(status=response.CalvinResponse(False, data=missing))
         self._node.control.log_application_destroy(application.id)
 
     def destroy_request(self, application_id, actor_ids):
@@ -272,16 +328,46 @@ class AppManager(object):
         _log.debug("Destroy request, app: %s, actors: %s" % (application_id, actor_ids))
         _log.analyze(self._node.id, "+", {'application_id': application_id, 'actor_ids': actor_ids})
         reply = response.CalvinResponse(True)
+        missing = []
         for actor_id in actor_ids:
             if actor_id in self._node.am.list_actors():
                 self._node.am.destroy(actor_id)
             else:
                 reply = response.CalvinResponse(False)
+                missing.append(actor_id)
+        reply.data = missing
         if application_id in self.applications:
             del self.applications[application_id]
         _log.debug("Destroy request reply %s" % reply)
         _log.analyze(self._node.id, "+ RESPONSE", {'reply': str(reply)})
         return reply
+
+    def destroy_request_with_disconnect(self, application_id, actor_ids, terminate, callback=None):
+        _log.analyze(self._node.id, "+", {'application_id': application_id, 'actor_ids': actor_ids})
+        missing = []
+        for actor_id in actor_ids[:]:
+            if actor_id in self._node.am.list_actors():
+                self._node.am.destroy_with_disconnect(actor_id, terminate,
+                    callback=CalvinCB(self._destroy_request_with_disconnect_cb, application_id=application_id,
+                                        actor_ids=actor_ids, actor_id=actor_id, callback=callback, missing=missing))
+            else:
+                self._destroy_request_with_disconnect_cb(
+                    application_id=application_id, actor_ids=actor_ids, callback=callback,
+                    missing=missing, actor_id=actor_id, status=response.CalvinResponse(False))
+
+    def _destroy_request_with_disconnect_cb(self, application_id, actor_ids, missing, status, actor_id, callback=None):
+        actor_ids.remove(actor_id)
+        if not status:
+            missing.append(actor_id)
+        if actor_ids:
+            return
+        if application_id in self.applications:
+            del self.applications[application_id]
+        if callback:
+            if missing:
+                callback(status=response.CalvinResponse(False, missing=missing))
+            else:
+                callback(status=response.CalvinResponse(True))
 
     def list_applications(self):
         """ Returns list of applications """
@@ -289,41 +375,6 @@ class AppManager(object):
 
 
     ### DEPLOYMENT REQUIREMENTS ###
-
-    def collect_placement(self, it, app):
-        _log.analyze(self._node.id, "+ BEGIN", {}, tb=True)
-        if app._collect_placement_cb:
-            app._collect_placement_cb.cancel()
-            app._collect_placement_cb = None
-        try:
-            while True:
-                _log.analyze(self._node.id, "+ ITER", {})
-                actor_node_id = it.next()
-                app._collect_placement_last_value = app._collect_placement_counter
-                app.actor_placement.setdefault(actor_node_id[0], set([])).add(actor_node_id[1])
-        except dynops.PauseIteration:
-            _log.analyze(self._node.id, "+ PAUSED",
-                    {'counter': app._collect_placement_counter,
-                     'last_value': app._collect_placement_last_value,
-                     'diff': app._collect_placement_counter - app._collect_placement_last_value})
-            # FIXME the dynops should be self triggering, but is not...
-            # This is a temporary fix by keep trying
-            delay = 0.0 if app._collect_placement_counter > app._collect_placement_last_value + 100 else 0.2
-            app._collect_placement_counter += 1
-            app._collect_placement_cb = async.DelayedCall(delay, self.collect_placement, it=it,
-                                                                    app=app)
-            return
-        except StopIteration:
-            if not app.done_final:
-                app.done_final = True
-                # all possible actor placements derived
-                _log.analyze(self._node.id, "+ ALL", {})
-                self._app_requirements(app)
-                _log.analyze(self._node.id, "+ END", {})
-        except:
-            _log.exception("appmanager:collect_placement")
-
-    ### DEPLOYMENT ###
 
     def execute_requirements(self, application_id, cb):
         """ Build dynops iterator to collect all possible placements,
@@ -340,93 +391,41 @@ class AppManager(object):
             return
         _log.debug("execute_requirements(app=%s)" % (self.applications[application_id],))
 
-        # TODO extract groups
-
         if hasattr(app, '_org_cb'):
             # application deployment requirements ongoing, abort
             cb(status=response.CalvinResponse(False))
             return
         app._org_cb = cb
-        app.done_final = False
-        app._collect_placement_counter = 0
-        app._collect_placement_last_value = 0
-        actor_placement_it = dynops.List()
         app.actor_placement = {}  # Clean placement slate
         _log.analyze(self._node.id, "+ APP REQ", {}, tb=True)
-        for actor_id in app.get_actors():
+        actor_ids = app.get_actors()
+        app.actor_placement_nbr = len(actor_ids)
+        for actor_id in actor_ids:
             if actor_id not in self._node.am.actors.keys():
                 _log.debug("Only apply requirements to local actors")
+                app.actor_placement[actor_id] = None
                 continue
             _log.analyze(self._node.id, "+ ACTOR REQ", {'actor_id': actor_id}, tb=True)
-            actor_req = self.actor_requirements(app, actor_id).set_name("Actor"+actor_id)
-            actor_placement_it.append((actor_id, actor_req), trigger_iter = actor_req)
+            r = ReqMatch(self._node,
+                         callback=CalvinCB(self.collect_placement, app=app, actor_id=actor_id))
+            r.match_for_actor(actor_id)
             _log.analyze(self._node.id, "+ ACTOR REQ DONE", {'actor_id': actor_id}, tb=True)
-        actor_placement_it.final()
-        collect_iter = dynops.Collect(actor_placement_it)
-        collect_iter.set_cb(self.collect_placement, collect_iter, app)
-        self.collect_placement(collect_iter, app)
         _log.analyze(self._node.id, "+ DONE", {'application_id': application_id}, tb=True)
 
-    def actor_requirements(self, app, actor_id):
-        if actor_id not in self._node.am.list_actors():
-            _log.error("Currently we ignore deployment requirements for actor not local to the node, %s" % actor_id)
+    def collect_placement(self, app, actor_id, possible_placements, status):
+        _log.analyze(self._node.id, "+ BEGIN", {}, tb=True)
+        # TODO look at status
+        app.actor_placement[actor_id] = possible_placements
+        if len(app.actor_placement) < app.actor_placement_nbr:
             return
-
-        actor = self._node.am.actors[actor_id]
-        _log.debug("actor_requirements(actor_id=%s), reqs=%s" % (actor_id, actor.requirements_get()))
-        intersection_iters = []
-        difference_iters = []
-        for req in actor.requirements_get():
-            if req['op']=='union_group':
-                # Special operation that first forms a union of a requirement's list response set
-                # To allow alternative requirements options
-                intersection_iters.append(self._union_requirements(req=req,
-                                                    app=app,
-                                                    actor_id=actor_id,
-                                                    component=actor.component_members()).set_name("SActor"+actor_id))
-            else:
-                try:
-                    _log.analyze(self._node.id, "+ REQ OP", {'op': req['op'], 'kwargs': req['kwargs']})
-                    it = req_operations[req['op']].req_op(self._node,
-                                            actor_id=actor_id,
-                                            component=actor.component_members(),
-                                            **req['kwargs']).set_name(req['op']+",SActor"+actor_id)
-                    if req['type']=='+':
-                        intersection_iters.append(it)
-                    elif req['type']=='-':
-                        difference_iters.append(it)
-                    else:
-                        _log.error("actor_requirements unknown req type %s for %s!!!" % (req['type'], actor_id),
-                                   exc_info=True)
-                except:
-                    _log.error("actor_requirements one req failed for %s!!!" % actor_id, exc_info=True)
-                    # FIXME how to handle failed requirements, now we drop it
-        return_iter = dynops.Intersection(*intersection_iters).set_name("SActor"+actor_id)
-        if difference_iters:
-            return_iter = dynops.Difference(return_iter, *difference_iters).set_name("SActor"+actor_id)
-        return return_iter
-
-    def _union_requirements(self, **state):
-        union_iters = []
-        for union_req in state['req']['requirements']:
-            try:
-                union_iters.append(req_operations[union_req['op']].req_op(self._node,
-                                        actor_id=state['actor_id'],
-                                        component=state['component'],
-                                        **union_req['kwargs']).set_name(union_req['op']+",UActor"+state['actor_id']))
-            except:
-                _log.error("union_requirements one req failed for %s!!!" % state['actor_id'], exc_info=True)
-        return dynops.Union(*union_iters)
-
-    def _app_requirements(self, app):
-        _log.debug("_app_requirements(app=%s)" % (app,))
+        # all possible actor placements derived
         _log.analyze(self._node.id, "+ ACTOR PLACEMENT", {'placement': app.actor_placement}, tb=True)
         status = response.CalvinResponse(True)
-        if any([not n for n in app.actor_placement.values()]) or len(app.actors) > len(app.actor_placement):
+        if any([not n for n in app.actor_placement.values()]):
             # At least one actor have no required placement
             # Let them stay on this node
-            for actor_id in [a for a in app.actors if a not in app.actor_placement]:
-                app.actor_placement[actor_id] = set([self._node.id])
+            app.actor_placement = {actor_id: set([self._node.id]) if placement is None else placement
+                                     for actor_id, placement in app.actor_placement.items()}
             # Status will indicate success, but be different than the normal OK code
             status = response.CalvinResponse(response.CREATED)
             _log.analyze(self._node.id, "+ MISS PLACEMENT", {'app_id': app.id, 'placement': app.actor_placement}, tb=True)
@@ -461,12 +460,13 @@ class AppManager(object):
             # TODO should select from a resource sharing perspective also, instead of picking first max
             # TODO: should also ask authorization server before selecting node to migrate to.
             _log.analyze(self._node.id, "+ WEIGHTS", {'actor_id': actor_id, 'weights': weights})
-            weighted_actor_placement[actor_id] = node_ids[weights.index(max(weights))]
-
+            #weighted_actor_placement[actor_id] = node_ids[weights.index(max(weights))]
+            # Get a list of nodes in sorted weighted order
+            weighted_actor_placement[actor_id] = [n for (w, n) in sorted(zip(weights, node_ids), reverse=True)]
         for actor_id, node_id in weighted_actor_placement.iteritems():
-            # TODO could add callback to try another possible node if the migration fails
             _log.debug("Actor deployment %s \t-> %s" % (app.actors[actor_id], node_id))
-            self._node.am.migrate(actor_id, node_id)
+            # FIXME add callback that recreate the actor locally
+            self._node.am.robust_migrate(actor_id, node_id[:], None)
 
         app._org_cb(status=status, placement=weighted_actor_placement)
         del app._org_cb
@@ -544,7 +544,7 @@ class AppManager(object):
         self._node.proto.actor_migrate(value['node_id'], CalvinCB(self._migrated_cb, app=app, actor_id=actor_id, cb=cb),
                                      actor_id, req, False, move)
 
-    def _migrated_cb(self, status, app, actor_id, cb):
+    def _migrated_cb(self, status, app, actor_id, cb, **kwargs):
         app._migrated_actors[actor_id] = status
         _log.analyze(self._node.id, "+", {'actor_id': actor_id, 'status': status, 'statuses': app._migrated_actors})
         if any([s is None for s in app._migrated_actors.values()]):
@@ -569,7 +569,6 @@ class Deployer(object):
         self.actor_map = {}
         self.actor_connections = {}
         self.node = node
-        #self.verify = verify  # FIXME: what is this used for?
         self.cb = cb
         self._verified_actors = {}
         self._deploy_counter = 0
@@ -625,11 +624,13 @@ class Deployer(object):
         actor_type = info['actor_type']
         try:
             actor_def, signer = self.node.am.lookup_and_verify(actor_type, self.sec)
+            info['signer'] = signer
+            info['requires'] = actor_def.requires if hasattr(actor_def, "requires") else []
         except Exception:
-            self.resolve_remote(actor_name, info, cb)
-            return
-        info['signer'] = signer
-        info['requires'] = actor_def.requires if hasattr(actor_def, "requires") else []
+            # Not found locally, must be made shadow actor
+            info = self.deployable['actors'][actor_name]
+            info['shadow_actor'] = True
+            actor_def = None
         self._verified_actors[actor_name] = (info, actor_def)
         if cb:
             cb()
@@ -656,6 +657,12 @@ class Deployer(object):
             info['shadow_actor'] = True
             self.instantiate(actor_name, info, cb=cb)
 
+    def _requirement_type(self, req):
+        try:
+            return req_operations[req['op']].req_type
+        except:
+            return "unknown"
+
     def instantiate(self, actor_name, info, actor_def=None, access_decision=None, cb=None):
         """
         Instantiate an actor.
@@ -666,18 +673,33 @@ class Deployer(object):
           - 'access_decision' is a boolean indicating if access is permitted
         """
         try:
+            if 'port_properties' in self.deployable:
+                port_properties = self.deployable['port_properties'].get(actor_name, None)
+            else:
+                port_properties = None
             info['args']['name'] = actor_name
             actor_id = self.node.am.new(actor_type=info['actor_type'], args=info['args'], signature=info['signature'], 
                                         actor_def=actor_def, security=self.sec, access_decision=access_decision, 
-                                        shadow_actor='shadow_actor' in info)
+                                        shadow_actor='shadow_actor' in info, port_properties=port_properties)
             if not actor_id:
                 raise Exception("Could not instantiate actor %s" % actor_name)
             deploy_req = self.get_req(actor_name)
             if deploy_req:
-                self.node.am.actors[actor_id].requirements_add(deploy_req, extend=False)
+                # Seperate replication and placement requirements
+                actor_reqs = copy.deepcopy(deploy_req)
+                reqs_replication = [r for r in actor_reqs if self._requirement_type(r) == "replication"]
+                if reqs_replication:
+                    actor_reqs.remove(reqs_replication[0])
+                    # Replication requirements
+                    self.node.rm.supervise_actor(actor_id, reqs_replication[0])
+                    if actor_reqs:
+                        self.node.am.actors[actor_id]._replication_data.inhibate(actor_id, True)
+                # Placement requirements
+                self.node.am.actors[actor_id].requirements_add(actor_reqs, extend=False)
             self.actor_map[actor_name] = actor_id
             self.node.app_manager.add(self.app_id, actor_id)
         except Exception as e:
+            _log.exception("INSTANTIATE FAILED")
             # FIXME: what should happen here?
             raise e
         finally:
@@ -702,123 +724,9 @@ class Deployer(object):
             peer_port_dir='out')
         return result
 
-    def select_actor(self, out_iter, kwargs, final, comp_name_desc):
-        _log.analyze(self.node.id, "+", {'comp_name_desc': comp_name_desc}, tb=True)
-        if final[0] and not kwargs['done']:
-            kwargs['done'] = True
-            for name, desc_list in kwargs['priority'].iteritems():
-                if desc_list:
-                    out_iter.append(desc_list[0])
-            out_iter.final()
-            return
-        desc = comp_name_desc[1]
-        try:
-            # List of (found, is_primitive, info, signer)
-            # TODO: call lookup_and_verify() instead
-            actor_types = [self.actorstore.lookup(actor['actor_type'])
-                                for actor in desc['component']['structure']['actors'].values()]
-        except KeyError:
-            actor_types = []
-            # Not a component, shadow actor candidate, likely
-            kwargs['priority'][comp_name_desc[0]].insert(0, comp_name_desc)
-            comp_name_desc[1]['shadow_actor'] = True
-            return
-        except Exception as e:
-            _log.exception("select_actor desc: %s" % desc)
-            raise e
-        if all([a[0] and a[1] for a in actor_types]):
-            # All found and primitive (quite unlikely), insert after any primitive shadow actors in priority
-            index = len([1 for a in kwargs['priority'][comp_name_desc[0]] if 'shadow_actor' in a[1]])
-            kwargs['priority'][comp_name_desc[0]].insert(index, comp_name_desc)
-            comp_name_desc[1]['shadow_component'] = actor_types
-            return
-        # A component containing shadow actors
-        # TODO Dig deeper to priorities between shadow components, now just insert in order
-        kwargs['priority'][comp_name_desc[0]].append(comp_name_desc)
-        comp_name_desc[1]['shadow_component'] = actor_types
-
-    def resolve_remote(self, actor_name, info, cb=None):
-        # FIXME: no list needed since it is only done for one actor
-        all_desc_iters = dynops.List()
-        store = GlobalStore(node=self.node)
-        desc_iter = store.global_lookup_iter(info['signature'], info['args'].keys())
-        all_desc_iters.append((actor_name, desc_iter), trigger_iter=desc_iter)
-        all_desc_iters.final()
-        collect_desc_iter = dynops.Collect(all_desc_iters).set_name("collected_desc")
-        select_iter = dynops.Map(self.select_actor, collect_desc_iter, done=False,
-                                 priority={k:[] for k in self.deployable['actors'].keys()},
-                                 eager=True).set_name("select_actor")
-        select_iter.set_cb(self.deploy_unhandled_actor, select_iter, cb)
-        self.deploy_unhandled_actor(select_iter, cb)
-
-    def deploy_unhandled_actor(self, comp_name_desc, cb=None):
-        while True:
-            try:
-                name, desc = comp_name_desc.next()
-                _log.analyze(self.node.id, "+", {'name': name, 'desc': desc}, tb=True)
-            except StopIteration:
-                return
-            except dynops.PauseIteration:
-                return
-            if 'shadow_actor' in desc:
-                _log.analyze(self.node.id, "+ SHADOW ACTOR", {'name': name})
-                # It was a normal primitive shadow actor, just add to list of verified actors.
-                info = self.deployable['actors'][name]
-                info['shadow_actor'] = True
-                self._verified_actors[name] = (info, None)
-            elif 'shadow_component' in desc:
-                _log.analyze(self.node.id, "+ SHADOW COMPONENT", {'name': name})
-                # A component that needs to be broken up into individual primitive actors
-                # First, get the component requirements and info
-                req = self.get_req(name)
-                info = self.deployable['actors'][name]
-                # Then add the new primitive actors
-                for actor_name, actor_desc in desc['component']['structure']['actors'].iteritems():
-                    args = {k: v[1] if v[0] == 'VALUE' else info['args'][v[1]] for k, v in actor_desc['args'].iteritems()}
-                    inports = [c['dst_port'] for c in desc['component']['structure']['connections'] if c['dst'] == actor_name]
-                    outports = [c['src_port'] for c in desc['component']['structure']['connections'] if c['src'] == actor_name]
-                    sign_desc = {'is_primitive': True,
-                                 'actor_type': actor_desc['actor_type'],
-                                 'inports': inports[:],
-                                 'outports': outports[:]}
-                    sign = GlobalStore.actor_signature(sign_desc)
-                    self._verified_actors[name + ":" + actor_name] = ({'args': args,
-                                                                      'actor_type': actor_desc['actor_type'],
-                                                                      'signature_desc': sign_desc,
-                                                                      'signature': sign}, None)
-                    # Replace component connections with actor connection
-                    #   outports
-                    comp_outports = [(c['dst_port'], c['src_port']) for c in desc['component']['structure']['connections']
-                                        if c['src'] == actor_name and c['dst'] == "."]
-                    for c_port, a_port in comp_outports:
-                        if (name + "." + c_port) in self.deployable['connections']:
-                            self.deployable['connections'][name + ":" + actor_name + "." + a_port] = \
-                                self.deployable['connections'].pop(name + "." + c_port)
-                    #   inports
-                    comp_inports = [(c['src_port'], c['dst_port']) for c in desc['component']['structure']['connections']
-                                        if c['dst'] == actor_name and c['src'] == "."]
-                    for outport, ports in self.deployable['connections'].iteritems():
-                        for c_inport, a_inport in comp_inports:
-                            if (name + "." + c_inport) in ports:
-                                ports.remove(name + "." + c_inport)
-                                ports.append(name + ":" + actor_name + "." + a_inport)
-                    _log.analyze(self.node.id, "+ REPLACED PORTS", {'comp_outports': comp_outports,
-                                                                   'comp_inports': comp_inports,
-                                                                   'actor_name': actor_name,
-                                                                   'connections': self.deployable['connections']})
-                    # Add any new component internal connections (enough with outports)
-                    for connection in desc['component']['structure']['connections']:
-                        if connection['src'] == actor_name and connection['src_port'] in outports and connection['dst'] != ".":
-                            self.deployable['connections'].setdefault(
-                                name + ":" + actor_name + "." + connection['src_port'], []).append(
-                                    name + ":" + connection['dst'] + "." + connection['dst_port'])
-                    _log.analyze(self.node.id, "+ ADDED PORTS", {'connections': self.deployable['connections']})
-                self.group_components()
-            if cb:
-                cb()
-
     def deploy(self):
-        """Verify actors, instantiate and link them together."""
+        """Verify actors, instantiate and link them together.
+        """
         if not self.deployable['valid']:
             raise Exception("Deploy information is not valid")
 
@@ -844,9 +752,17 @@ class Deployer(object):
         for src, dst_list in self.deployable['connections'].iteritems():
             if len(dst_list) > 1:
                 src_name, src_port = src.split('.')
-                # TODO get routing method from actor or calvinscript, now set only existing option
+                _log.debug("GET PROPERTIES for %s, %s.%s" % (src, src_name, src_port))
+                current_properties = self.node.pm.get_port_properties(
+                                        actor_id=self.actor_map[src_name], port_dir='out', port_name=src_port)
+                kwargs = {'nbr_peers': len(dst_list)}
+                if 'routing' in current_properties and current_properties['routing'] != 'default':
+                    kwargs['routing'] = current_properties['routing']
+                else:
+                    kwargs['routing'] = 'fanout'
+                _log.debug("CURRENT PROPERTIES\n%s\n%s" % (current_properties, kwargs))
                 self.node.pm.set_port_properties(actor_id=self.actor_map[src_name], port_dir='out', port_name=src_port,
-                                                 routing='fanout', nbr_peers=len(dst_list))
+                                                 **kwargs)
 
         for src, dst_list in self.deployable['connections'].iteritems():
             src_actor, src_port = src.split('.')

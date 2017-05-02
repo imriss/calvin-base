@@ -22,7 +22,9 @@ import Queue
 from twisted.internet import reactor, defer, threads
 
 from calvin.runtime.south.plugins.storage.twistedimpl.dht.append_server import AppendServer
-from calvin.runtime.south.plugins.storage.twistedimpl.dht.service_discovery_ssdp import SSDPServiceDiscovery
+from calvin.runtime.south.plugins.storage.twistedimpl.dht.service_discovery_ssdp import SSDPServiceDiscovery,\
+                                                                                              SERVICE_UUID,\
+                                                                                              CA_SERVICE_UUID
 from calvin.runtime.north.plugins.storage.storage_base import StorageBase
 from calvin.utilities import calvinlogger
 from calvin.utilities import calvinconfig
@@ -128,11 +130,13 @@ class TwistedWaitObject(object):
 
 
 class AutoDHTServer(StorageBase):
-    def __init__(self):
+    def __init__(self, node_id, control_uri):
         super(AutoDHTServer, self).__init__()
         self.dht_server = None
         self._ssdps = None
         self._started = False
+        self._node_id = node_id
+        self._control_uri = control_uri
 
     def start(self, iface='', network=None, bootstrap=None, cb=None, name=None, nodeid=None):
         if bootstrap is None:
@@ -147,8 +151,17 @@ class AutoDHTServer(StorageBase):
         dlist = []
         dlist.append(self.dht_server.bootstrap(bootstrap))
 
-        self._ssdps = SSDPServiceDiscovery(iface)
+        self._ssdps = SSDPServiceDiscovery(self._node_id, self._control_uri, iface)
         dlist += self._ssdps.start()
+
+        domain = _conf.get("security", "domain_name")
+        is_ca = False
+        try:
+            if _conf.get("security", "certificate_authority") == "True":
+                is_ca = True
+        except:
+            is_ca = False
+        self._ssdps.update_server_params(CA_SERVICE_UUID, sign=is_ca, name=name)
 
         _log.debug("Register service %s %s:%s" % (network, ip, port))
         self._ssdps.register_service(network, ip, port)

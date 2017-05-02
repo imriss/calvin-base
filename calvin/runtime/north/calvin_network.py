@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import os
+import time
 import glob
 import importlib
 
@@ -31,18 +32,46 @@ _conf = calvinconfig.get()
 TRANSPORT_PLUGIN_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), *['south', 'plugins', 'transports'])
 TRANSPORT_PLUGIN_NS = "calvin.runtime.south.plugins.transports"
 
-class CalvinLink(object):
+
+class CalvinBaseLink(object):
+    """ Base class for a link
+    """
+
+    def __init__(self, peer_id):
+        super(CalvinBaseLink, self).__init__()
+        self.peer_id = peer_id
+        self._rtt = None
+
+    def reply_handler(self, payload):
+        raise NotImplementedError()
+
+    def send_with_reply(self, callback, msg, dest_peer_id=None):
+        raise NotImplementedError()
+
+    def send(self, msg, dest_peer_id=None):
+        raise NotImplementedError()
+
+    def close(self, dest_peer_id=None):
+        raise NotImplemented()
+
+    def get_rtt(self):
+        return self._rtt
+
+class CalvinLink(CalvinBaseLink):
     """ CalvinLink class manage one RT to RT link between
         rt_id and peer_id using transport as mechanism.
         transport: a plug-in transport object
         old_link: should be supplied when we replace an existing link, will be closed
     """
 
-    def __init__(self, rt_id, peer_id, transport, old_link=None):
-        super(CalvinLink, self).__init__()
+    def __init__(self, rt_id, peer_id, transport, server_node_name=None, old_link=None):
+        super(CalvinLink, self).__init__(peer_id)
+        self._rtt = transport.get_rtt()
+        if self._rtt is None:
+            self._rtt = 0.2
         self.rt_id = rt_id
-        self.peer_id = peer_id
         self.transport = transport
+        self.routes = old_link.routes if old_link else []
         # FIXME replies should also be made independent on the link object,
         # to handle dying transports losing reply callbacks
         self.replies = old_link.replies if old_link else {}
@@ -58,14 +87,23 @@ class CalvinLink(object):
         try:
             # Cancel timeout
             self.replies_timeout.pop(payload['msg_uuid']).cancel()
-        except:
+        except KeyError:
+            _log.warning("Tried to handle reply for unknown message msgid %s", payload['msg_uuid'])
             # We ignore any errors in cancelling timeout
             pass
 
         try:
             # Call the registered callback,for the reply message id, with the reply data as argument
-            self.replies.pop(payload['msg_uuid'])(response.CalvinResponse(encoded=payload['value']))
-        except:
+            reply = self.replies.pop(payload['msg_uuid'])
+
+            # RTT here also inlcudes delay(actors running...) times in remote runtime
+            self._rtt = (self._rtt*2 + (time.time() - reply['send_time']))/3
+
+            reply['callback'](response.CalvinResponse(encoded=payload['value']))
+        except KeyError:
+            _log.warning("Tried to handle reply for unknown message msgid %s", payload['msg_uuid'])
+        except: # Dangerous but needed
+            _log.exception("Unknown exception in response handler")
             # We ignore unknown replies
             return
 
@@ -74,25 +112,30 @@ class CalvinLink(object):
         try:
             # remove timeout
             self.replies_timeout.pop(msg_id)
-        except:
+        except KeyError:
+            _log.warning("Tried to handle reply for unknown message msgid %s", payload['msg_uuid'])
+            # We ignore any errors in cancelling timeout
             pass
-        try:
-            self.replies.pop(msg_id)(response.CalvinResponse(response.GATEWAY_TIMEOUT))
-        except:
-            # We ignore errors
-            return
 
-    def send_with_reply(self, callback, msg):
+        try:
+            self.replies.pop(msg_id)['callback'](response.CalvinResponse(response.GATEWAY_TIMEOUT))
+        except KeyError:
+            _log.warning("Tried to handle reply for unknown message msgid %s", payload['msg_uuid'])
+        except: # Dangerous but needed
+            _log.exception("Unknown exception in response handler")
+            # We ignore unknown replies
+
+    def send_with_reply(self, callback, msg, dest_peer_id=None):
         """ Adds a message id to the message and send it,
             also registers the callback for the reply.
         """
         msg_id = calvinuuid.uuid("MSGID")
-        self.replies[msg_id] = callback
+        self.replies[msg_id] = {'callback': callback, 'send_time': time.time()}
         self.replies_timeout[msg_id] = async.DelayedCall(10.0, CalvinCB(self.reply_timeout, msg_id))
         msg['msg_uuid'] = msg_id
-        self.send(msg)
+        self.send(msg, dest_peer_id)
 
-    def send(self, msg):
+    def send(self, msg, dest_peer_id=None):
         """ Adds the from and to node ids to the message and
             sends the message using the transport.
 
@@ -100,14 +143,43 @@ class CalvinLink(object):
             two nodes. But is included for verification and to later allow routing of messages.
         """
         msg['from_rt_uuid'] = self.rt_id
-        msg['to_rt_uuid'] = self.peer_id
+        msg['to_rt_uuid'] = self.peer_id if dest_peer_id is None else dest_peer_id
         _log.analyze(self.rt_id, "SEND", msg)
         self.transport.send(msg)
 
-    def close(self):
+    def close(self, dest_peer_id=None):
         """ Disconnect the transport and hence the link object won't work anymore """
         _log.analyze(self.rt_id, "+ LINK", {})
-        self.transport.disconnect()
+        if dest_peer_id is None:
+            self.transport.disconnect()
+
+
+class CalvinRoutingLink(CalvinBaseLink):
+    """ CalvinRoutingLink class manage one RT to RT link between
+        this peer and peer_id using link as an proxy.
+    """
+
+    def __init__(self, peer_id, link):
+        super(CalvinRoutingLink, self).__init__(peer_id)
+        self.link = link
+
+    def reply_handler(self, payload):
+        """ Call reply_handler on link """
+        self.link.reply_handler(payload)
+
+    def send_with_reply(self, callback, msg, dest_peer_id=None):
+        """ Call send_with_reply on link with peer_id.
+        """
+        self.link.send_with_reply(callback, msg, self.peer_id)
+
+    def send(self, msg, dest_peer_id=None):
+        """ Send msg on transport.
+        """
+        self.link.send(msg, self.peer_id)
+
+    def close(self, dest_peer_id=None):
+        """ Call disconnect on link """
+        self.link.disconnect(self.peer_id)
 
 
 class CalvinNetwork(object):
@@ -126,15 +198,21 @@ class CalvinNetwork(object):
         self.node = node
         self.transport_modules = {}  # key module namespace string, value: imported module (must have register function)
         self.transports = {}  # key: URI schema, value: transport factory that handle URI
-        self.links = {}  # key peer node id, value: CalvinLink obj
-        self.recv_handler = None
+        self._links = {}  # key peer node id, value: CalvinLink obj
+        self._peer_cache = {}  # key peer node id, value is a dict with uri list and timestamp(age) and a list with callbacks
+        self._recv_handler = self.__recv_handler
         self.pending_joins = {}  # key: uri, value: list of callbacks or None
         self.pending_joins_by_id = {}  # key: peer id, value: uri
         self.control = self.node.control
 
+    def __recv_handler(self, tp_link, payload):
+        _log.debug("Dummy recv handler")
+        pass
+
     def register_recv(self, recv_handler):
         """ Register THE function that will receive all incomming messages on all links """
-        self.recv_handler = recv_handler
+        _log.debug("Register recv handler %s over old handler %s", recv_handler, self._recv_handler)
+        self._recv_handler = recv_handler
 
     def register(self, schemas, formats):
         """ Load and registers all transport plug-in modules matching the list of schemas.
@@ -159,33 +237,61 @@ class CalvinNetwork(object):
             try:
                 self.transport_modules[m] = importlib.import_module(TRANSPORT_PLUGIN_NS + "." + m)
                 # Get a dictionary of schemas -> transport factory
-                schema_objects = self.transport_modules[m].register(self.node.id,
-                                                                    {'join_finished': [CalvinCB(self.join_finished)],
-                                                                     'data_received': [self.recv_handler],
-                                                                     'peer_disconnected': [CalvinCB(self.peer_disconnected)]},
-                                                                    schemas, formats)
+                if hasattr(self.transport_modules[m], 'register') and callable(self.transport_modules[m].register):
+                    schema_objects = self.transport_modules[m].register(self.node.id,
+                                                                        self.node.node_name,
+                                                                        {'join_finished': [CalvinCB(self._join_finished)],
+                                                                         'join_failed': [CalvinCB(self._join_failed)],
+                                                                         'server_started': [CalvinCB(self._server_started)],
+                                                                         'server_stopped': [CalvinCB(self._server_stopped)],
+                                                                         'data_received': [CalvinCB(self._recv_handler)],
+                                                                         'peer_connection_failed': [CalvinCB(self._peer_connection_failed)],
+                                                                         'peer_disconnected': [CalvinCB(self._peer_disconnected)]},
+                                                                        schemas, formats)
+                else:
+                    del self.transport_modules[m]
+                    continue
             except:
-                _log.debug("Could not register transport plugin %s" % (m,))
+                _log.warning("Could not register transport plugin %s.%s", TRANSPORT_PLUGIN_NS, m, exc_info=True)
                 continue
             if schema_objects:
-                _log.debug("Register transport plugin %s" % (m,))
+                _log.debug("Register transport plugin %s.%s", TRANSPORT_PLUGIN_NS, m,)
                 # Add them to the list - currently only one module can handle one schema
                 self.transports.update(schema_objects)
 
-    def start_listeners(self, uris=None):
+    def _server_started(self, *args):
+        _log.debug("Server started %s", args)
+
+    def _server_stopped(self, *args):
+        _log.debug("Server stopped %s", args)
+
+    def start_listeners(self, uris=None, stop_callback=None):
         """ Start the transport listening on the uris
             uris: optional list of uri strings. When not provided all schemas will be started.
                   a '<schema>:default' uri can be used to indicate that the transport should
                   use a default configuration, e.g. choose port number.
         """
         if not uris:
-            uris = [schema + ":default" for schema in self.transports.keys()]
+            uris = [schema + "://default" for schema in self.transports.keys()]
 
         for uri in uris:
             schema, addr = uri.split(':', 1)
             self.transports[schema].listen(uri)
 
-    def join(self, uris, callback=None, corresponding_peer_ids=None):
+    def stop_listeners(self, uris=None, start_callback=None):
+        """ Start the transport listening on the uris
+            uris: optional list of uri strings. When not provided all schemas will be started.
+                  a '<schema>:default' uri can be used to indicate that the transport should
+                  use a default configuration, e.g. choose port number.
+        """
+        if not uris:
+            uris = [schema + "://default" for schema in self.transports.keys()]
+
+        for uri in uris:
+            schema, addr = uri.split(':', 1)
+            self.transports[schema].stop_listening(uri)
+
+    def join(self, uris, callback=None, corresponding_peer_ids=None, corresponding_server_node_names=None):
         """ Join the peers accessable from list of URIs
             It is possible to have a list of corresponding peer_ids,
             which is used to filter the uris list for already connected
@@ -201,14 +307,18 @@ class CalvinNetwork(object):
         """
         _log.analyze(self.node.id, "+ BEGIN", {'uris': uris,
                                                'peer_ids': corresponding_peer_ids,
+                                               'server_node_names': corresponding_server_node_names,
                                                'pending_joins': self.pending_joins,
                                                'pending_joins_by_id': self.pending_joins_by_id}, tb=True)
         # For each URI and when available a peer id
         if not (corresponding_peer_ids and len(uris) == len(corresponding_peer_ids)):
             corresponding_peer_ids = [None] * len(uris)
+        # For each URI and when available a server node name
+        if not (corresponding_server_node_names and len(uris) == len(corresponding_server_node_names)):
+            corresponding_server_node_names = [None] * len(uris)
 
-        for uri, peer_id in zip(uris, corresponding_peer_ids):
-            if not (uri in self.pending_joins or peer_id in self.pending_joins_by_id or peer_id in self.links):
+        for uri, peer_id, server_node_name in zip(uris, corresponding_peer_ids, corresponding_server_node_names):
+            if not (uri in self.pending_joins or peer_id in self.pending_joins_by_id or peer_id in self._links):
                 # No simultaneous join detected
                 schema = uri.split(":", 1)[0]
                 _log.analyze(self.node.id, "+", {'uri': uri, 'peer_id': peer_id, 'schema': schema, 'transports': self.transports.keys()}, peer_node_id=peer_id)
@@ -220,12 +330,14 @@ class CalvinNetwork(object):
                         self.pending_joins[uri] = [callback]
                     # Ask the transport plugin to do the join
                     _log.analyze(self.node.id, "+ TRANSPORT", {'uri': uri, 'peer_id': peer_id}, peer_node_id=peer_id)
-                    self.transports[schema].join(uri)
+                    self.transports[schema].join(uri, server_node_name)
+                else:
+                    _log.warning("Trying to join non existing transport %s", schema)
             else:
                 # We have simultaneous joins
                 _log.analyze(self.node.id, "+ SIMULTANEOUS", {'uri': uri, 'peer_id': peer_id}, peer_node_id=peer_id)
                 if callback:
-                    if peer_id in self.links:
+                    if peer_id in self._links:
                         # Link was already established, then need to call the callback now
                         callback(status=response.CalvinResponse(True), uri=uri)
                         continue
@@ -235,7 +347,7 @@ class CalvinNetwork(object):
                     else:
                         self.pending_joins[uri] = [callback]
 
-    def join_finished(self, tp_link, peer_id, uri, is_orginator):
+    def _join_finished(self, tp_link, peer_id, uri, is_orginator):
         """ Peer join is (not) accepted, called by transport plugin.
             This may be initiated by us (is_orginator=True) or by the peer,
             i.e. both nodes get called.
@@ -261,12 +373,12 @@ class CalvinNetwork(object):
                         cb(status=response.CalvinResponse(response.SERVICE_UNAVAILABLE), uri=uri, peer_node_id=peer_id)
             return
         # Only support for one RT to RT communication link per peer
-        if peer_id in self.links:
+        if peer_id in self._links:
             # Likely simultaneous join requests, use the one requested by the node with highest id
             if is_orginator and self.node.id > peer_id:
                 # We requested it and we have highest node id, hence the one in links is the peer's and we replace it
                 _log.analyze(self.node.id, "+ REPLACE ORGINATOR", {'uri': uri, 'peer_id': peer_id}, peer_node_id=peer_id)
-                self.links[peer_id] = CalvinLink(self.node.id, peer_id, tp_link, self.links[peer_id])
+                self._links[peer_id] = CalvinLink(self.node.id, peer_id, tp_link, self._links[peer_id])
             elif is_orginator and self.node.id < peer_id:
                 # We requested it and peer have highest node id, hence the one in links is peer's and we close this new
                 _log.analyze(self.node.id, "+ DROP ORGINATOR", {'uri': uri, 'peer_id': peer_id}, peer_node_id=peer_id)
@@ -278,14 +390,14 @@ class CalvinNetwork(object):
             elif not is_orginator and self.node.id < peer_id:
                 # Peer requested it and peer have highest node id, hence the one in links is ours and we replace it
                 _log.analyze(self.node.id, "+ REPLACE", {'uri': uri, 'peer_id': peer_id}, peer_node_id=peer_id)
-                self.links[peer_id] = CalvinLink(self.node.id, peer_id, tp_link, self.links[peer_id])
+                self._links[peer_id] = CalvinLink(self.node.id, peer_id, tp_link, old_link=self._links[peer_id])
         else:
             # No simultaneous join detected, just add the link
             _log.analyze(self.node.id, "+ INSERT", {'uri': uri, 'peer_id': peer_id}, peer_node_id=peer_id, tb=True)
-            self.links[peer_id] = CalvinLink(self.node.id, peer_id, tp_link)
+            self._links[peer_id] = CalvinLink(self.node.id, peer_id, tp_link)
 
         # Find and call any callbacks registered for the uri or peer id
-        _log.debug("%s: peer_id: %s, uri: %s\npending_joins_by_id: %s\npending_joins: %s" % (self.node.id, peer_id,
+        _log.debug("join _finished: %s: peer_id: %s, uri: %s\npending_joins_by_id: %s\npending_joins: %s" % (self.node.id, peer_id,
                                                                                          uri,
                                                                                          self.pending_joins_by_id,
                                                                                          self.pending_joins))
@@ -306,12 +418,27 @@ class CalvinNetwork(object):
         self.control.log_link_connected(peer_id, uri)
         return
 
+    def _join_failed(self, tp_link, peer_id, uri, is_orginator, reason):
+        cbs = self.pending_joins.pop(uri)
+        if cbs:
+            for cb in cbs:
+                cb(status=response.CalvinResponse(False), uri=uri, peer_node_id=None)
+        _log.warning("Join failed on uri %s, reason %s(%s)", uri, reason['reason'], reason['info'])
+
     def link_get(self, peer_id):
         """ Get a link by node id """
-        return self.links.get(peer_id, None)
+        return self._links.get(peer_id, None)
 
-    def link_request(self, peer_id, callback=None):
-        """ Request that a link is established. This is the prefered way
+    def _callback_link(self, peer_id, callback=None):
+        # TODO: Do checks here ?!?
+        if callback:
+            callback(peer_id, self._links[peer_id], status=response.CalvinResponse(True))
+        else:
+            _log.warning("Trying to send callback but got None!")
+
+    def link_request(self, peer_id, callback=None, **kwargs):
+        """
+            Request that a link is established. This is the prefered way
             of joining other nodes.
             peer_id: the node id that the link should be establieshed to
             callback: will get called with arguments status and uri used
@@ -319,26 +446,140 @@ class CalvinNetwork(object):
 
             returns: True when link already exist, False when link needs to be established
         """
-        if peer_id in self.links:
-            return True
-        _log.analyze(self.node.id, "+ CHECK STORAGE", {}, peer_node_id=peer_id, tb=True)
-        # We don't have the peer, let's ask for it in storage
-        self.node.storage.get_node(peer_id, CalvinCB(self.link_request_finished, callback=callback))
-        return False
+        status = kwargs.pop('status', True)
+        if not status:
+            callback(peer_id, None, status)
 
-    def link_request_finished(self, key, value, callback):
+        if peer_id in self._links:
+            # We have a link lets give it back
+            self._callback_link(peer_id, callback)
+            return self._links[peer_id]
+        elif peer_id in self._peer_cache: # Cache will be invalidated on failures
+            _log.analyze(self.node.id, "+ USE CACHE", {}, peer_node_id=peer_id, tb=True)
+            self._link_request(peer_id, callback=callback)
+            return None
+
+        # We don't have the peer, let's ask for it in storage
+        _log.analyze(self.node.id, "+ CHECK STORAGE", {}, peer_node_id=peer_id, tb=True)
+        self._peer_cache[peer_id] = {'uris': [], 'timestamp': 0, 'callbacks': [callback]}
+        self.node.storage.get_node(peer_id, CalvinCB(self._update_cache_request_finished, callback=None))
+        return None
+
+    def _execute_cached_callbacks(self, peer_id):
+        if peer_id in self._peer_cache:
+            cbs = self._peer_cache[peer_id].pop('callbacks')
+            self._peer_cache[peer_id]['callbacks'] = []
+            if cbs:
+                for cb in cbs:
+                    self._callback_link(peer_id, cb)
+
+    def _link_request_finished(self, status=None, peer_node_id=None, uri=None, peer_id=None):
+        """
+            Will be called when join works or fails also on connection fails.
+            Can be called multiple times one for each uri, but will stop on one success.
+            This function will try all uris for a node and after that invalidate the cache if its too old.
+
+            If all fails it will give up and make the callbacks, if join fails then it also stops.
+            It means that the other end dont want us.
+
+        """
+        # TODO: Should save if we are the originator, for reconnect reasons
+        _log.debug("link request finished %s, %s, %s", status, peer_node_id, uri)
+        if status:
+            # It worked!
+            _log.debug("Join success on peer %s with uri %s", peer_id, uri)
+            self._execute_cached_callbacks(peer_id)
+            # trigger routed links on link
+            link = self._links[peer_id]
+            for route in link.routes:
+                self._execute_cached_callbacks(peer_id)
+        else:
+            _ = self._peer_cache[peer_id]['uris'].pop(0)
+            _log.debug("Failed to connect to uri %s", _)
+            if self._peer_cache[peer_id]['uris']:
+                _log.debug("Trying next %s", self._peer_cache[peer_id]['uris'][0])
+                self._link_request(peer_id, force=True)
+            elif self._peer_cache[peer_id]['timestamp'] + 5*60 < time.time():
+                _log.debug("Cache old %s sec, updateing cache", time.time() - self._peer_cache[peer_id]['timestamp'])
+                # Invalidate cache and try one more time
+                # WARNING: here if one iteration takes more then 5 minutes then we are in a retry loop :/
+                self.node.storage.get_node(peer_id, CalvinCB(self._update_cache_request_finished, callback=None))
+            else:
+                cbs = self._peer_cache[peer_id].pop('callbacks')
+                self._peer_cache[peer_id]['callbacks'] = []
+                if cbs:
+                    for cb in cbs:
+                        cb(peer_id, None, status=response.CalvinResponse(False))
+                _log.warning("Join failed on peer %s on all uris", peer_id)
+
+    def _link_request(self, peer_id, callback=None, force=False):
+        """
+            Called on the cached items when the node wants to
+            connect to another node.
+            Can be called multiple times and will generate callbacks for all requests.
+            The callback will be called when all entries have failed or one have succeded.
+
+            force: is for cache invalidation, same request
+
+            When all the uris have failed or the cache is to old it will be invalidated and a new
+            connection cycle is started.
+
+        """
+        _log.debug("Internal link request node %s, force %s", peer_id, force)
+        if not self._peer_cache[peer_id]['callbacks'] or force:
+            if not self._peer_cache[peer_id]['callbacks'] and callback:
+                self._peer_cache[peer_id]['callbacks'] = [callback]
+            _log.debug("First call or force")
+            self.join([self._peer_cache[peer_id]['uris'][0]], CalvinCB(self._link_request_finished, peer_id=peer_id),
+                      corresponding_server_node_names=[self._peer_cache[peer_id]['server_name']])
+        elif callback:
+            _log.debug("Trying to join already ongoing join, just adding callback %s", callback)
+            self._peer_cache[peer_id]['callbacks'].append(callback)
+
+    def _routing_link_finished(self, peer_id, link, status, dest_peer_id, callback):
+        if not link or not status:
+            _log.error("Failed to create routed link to '%s' through '%s'", dest_peer_id, peer_id)
+        else:
+            self._links[dest_peer_id] = CalvinRoutingLink(dest_peer_id, link)
+            link.routes.append(dest_peer_id)
+            self._execute_cached_callbacks(dest_peer_id)
+
+    def _update_cache_request_finished(self, key, value, callback, force=False):
         """ Called by storage when the node is (not) found """
+        _log.debug("Got response from storage key = %s, value = %s, callback = %s, force = %s", key, value, callback, force)
         _log.analyze(self.node.id, "+", {'value': value}, peer_node_id=key, tb=True)
+
         # Test if value is None or False indicating node does not currently exist in storage
         if not value:
             # the peer_id did not exist in storage
+            _log.info("Failed to get node %s info from storage", key)
+            if key in self._peer_cache:
+                self._peer_cache.pop(key)
             callback(status=response.CalvinResponse(response.NOT_FOUND, {'peer_node_id': key}))
             return
 
-        # join the peer node
-        # TODO: if connection fails, retry with other transport schemes
-        self.join([self.get_supported_uri(value['uri'])], callback, [key])
+        matching = [s for s in value['attributes']['indexed_public'] if "node_name" in s]
+        if matching:
+            first_match = matching[0].split("node_name/")[1]
+            server_node_name_as_str = first_match.replace("/","-")
+        else:
+            server_node_name_as_str = None
 
+        # Set values from storage
+        self._peer_cache[key]['uris'] = value['uris']
+        self._peer_cache[key]['timestamp'] = time.time()
+        self._peer_cache[key]['server_name'] = server_node_name_as_str
+
+        if 'proxy' not in value:
+            # join the peer node
+            self._link_request(key, callback=callback, force=True)
+        else:
+            if value['proxy'] == self.node.id:
+                _log.error("No link to proxy client '%s'", key)
+            else:
+                self.link_request(value['proxy'], CalvinCB(self._routing_link_finished, dest_peer_id=key, callback=callback))
+
+    # Static
     def get_supported_uri(self, uri_or_uris):
         """ Match configured transport interfaces with uris and return first match.
             returns: First supported uri, None if no match
@@ -347,20 +588,39 @@ class CalvinNetwork(object):
             uris = [uri_or_uris]
         else :
             uris = uri_or_uris
-            
+
         transports = _conf.get(None, 'transports')
-            
-        for transport in transports:
-            for uri in uris:
+
+        supported_uris = []
+
+        for uri in uris:
+            for transport in transports:
                 if uri.startswith(transport):
-                    return uri
+                    supported_uris.append(uri)
+
+        if supported_uris:
+            return supported_uris
         return None
 
-    def peer_disconnected(self, link, rt_id, reason):
+    # TODO: send the peer_id and so on upstream
+    def _peer_connection_failed(self, tp_link, uri, status):
+        cbs = self.pending_joins.pop(uri)
+        if cbs:
+            for cb in cbs:
+                cb(status=response.CalvinResponse(False), uri=uri, peer_node_id=None)
+
+        _log.warning("Connection failed on uri %s, status %s", uri, status)
+
+    def _peer_disconnected(self, link, rt_id, reason):
+        if reason == "ERROR": _log.warning("Peer disconnected %s with reason %s", rt_id, reason)
+        else: _log.debug("Peer disconnected %s with reason %s", rt_id, reason)
         _log.analyze(self.node.id, "+", {'reason': reason,
-                                         'links_equal': link == self.links[rt_id].transport if rt_id in self.links else "Gone"},
+                                         'links_equal': link == self._links[rt_id].transport if rt_id in self._links else "Gone"},
                                          peer_node_id=rt_id)
-        if rt_id in self.links and link == self.links[rt_id].transport:
+        if rt_id in self._links and link == self._links[rt_id].transport:
+            for route in self._links[rt_id].routes[:]:
+                self.link_remove(route)
+                self.control.log_link_disconnected(route)
             self.link_remove(rt_id)
         self.control.log_link_disconnected(rt_id)
 
@@ -368,14 +628,22 @@ class CalvinNetwork(object):
         """ Removes a link to peer id """
         _log.analyze(self.node.id, "+", {}, peer_node_id=peer_id)
         try:
-            self.links.pop(peer_id)
-        except:
-            pass
+            link = self._links[peer_id]
+            if isinstance(link, CalvinRoutingLink):
+                link.link.routes.remove(peer_id)
+                self._links.pop(peer_id)
+            else:
+                self._links.pop(peer_id)
+        except KeyError:
+            _log.error("Tried to remove non existing link to peer_id %s", peer_id)
 
     def link_check(self, rt_uuid):
         """ Check if we have the link otherwise raise exception """
-        if rt_uuid not in self.links.iterkeys():
-            raise Exception("ERROR_LINK_NOT_ESTABLISHED")
+        if rt_uuid not in self._links.iterkeys():
+            raise KeyError("ERROR_LINK_NOT_ESTABLISHED")
 
     def list_links(self):
-        return list(self.links.keys())
+        return list(self._links.keys())
+
+    def list_direct_links(self):
+        return [peer_id for peer_id, l in self._links.items() if isinstance(l, CalvinLink)]

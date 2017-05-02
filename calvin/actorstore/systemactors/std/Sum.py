@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition
+from calvin.actor.actor import Actor, manage, condition
 
 
 class Sum(Actor):
@@ -33,7 +33,10 @@ class Sum(Actor):
     @condition(['integer'], ['integer'])
     def sum(self, input):
         self.sum = self.sum + input
-        return ActionResult(production=(self.sum, ))
+        return (self.sum, )
+
+    def report(self):
+        return self.sum
 
     action_priority = (sum, )
 

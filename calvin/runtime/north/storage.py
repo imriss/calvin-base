@@ -16,6 +16,7 @@
 
 from calvin.runtime.north.plugins.storage import storage_factory
 from calvin.runtime.north.plugins.coders.messages import message_coder_factory
+from calvin.csparser.port_property_syntax import list_port_property_capabilities
 from calvin.runtime.south.plugins.async import async
 from calvin.utilities import calvinlogger
 from calvin.utilities.calvin_callback import CalvinCB
@@ -37,17 +38,21 @@ class Storage(object):
     All functions in this class should be async and never block.
     """
 
-    def __init__(self, node):
+    def __init__(self, node, override_storage=None):
         self.localstore = {}
         self.localstore_sets = {}
         self.started = False
         self.node = node
-        storage_type = _conf.get(None, 'storage_type')
-        self.proxy = _conf.get(None, 'storage_proxy') if storage_type == 'proxy' else None
+        storage_type = _conf.get('global', 'storage_type')
+        _log.info("#### STORAGE TYPE %s ####", storage_type)
+        self.proxy = _conf.get('global', 'storage_proxy') if storage_type == 'proxy' else None
         _log.analyze(self.node.id, "+", {'proxy': self.proxy})
         self.tunnel = {}
         self.starting = storage_type != 'local'
-        self.storage = storage_factory.get(storage_type, node)
+        if override_storage:
+            self.storage = override_storage
+        else:
+            self.storage = storage_factory.get(storage_type, node)
         self.coder = message_coder_factory.get("json")  # TODO: always json? append/remove requires json at the moment
         self.flush_delayedcall = None
         self.reset_flush_timeout()
@@ -113,6 +118,19 @@ class Storage(object):
         self.trigger_flush(0)
         if kwargs["org_cb"]:
             async.DelayedCall(0, kwargs["org_cb"], args[0])
+
+    def dump(self):
+        "Dump the local storage to a temp file"
+        import tempfile
+        import json
+        with tempfile.NamedTemporaryFile(mode='w', prefix="storage", delete=False) as fp:
+            fp.write("[")
+            json.dump({k: json.loads(v) for k, v in self.localstore.items()}, fp)
+            fp.write(", ")
+            json.dump({k: list(v['+']) for k, v in self.localstore_sets.items()}, fp)
+            fp.write("]")
+            name = fp.name
+        return name
 
     def start(self, iface='', cb=None):
         """ Start storage
@@ -194,7 +212,6 @@ class Storage(object):
 
         # Always save locally
         self.localstore[prefix + key] = value
-
         if self.started:
             self.storage.set(key=prefix + key, value=value, cb=CalvinCB(func=self.set_cb, org_key=key, org_value=value, org_cb=cb))
         elif cb:
@@ -284,7 +301,10 @@ class Storage(object):
         """
         if value:
             value = self.coder.decode(value)
-            org_cb(org_key, list(set(value + local_list)))
+            if isinstance(value, (list, tuple, set)):
+                org_cb(org_key, list(set(value + local_list)))
+            else:
+                org_cb(org_key, local_list if local_list else None)
         else:
             org_cb(org_key, local_list if local_list else None)
 
@@ -329,7 +349,8 @@ class Storage(object):
         if value:
             value = self.coder.decode(value)
             _log.analyze(self.node.id, "+ VALUE", {'value': value, 'key': org_key})
-            it.extend([(org_key, v) for v in value] if include_key else value)
+            if isinstance(value, (list, tuple, set)):
+                it.extend([(org_key, v) for v in value] if include_key else value)
         it.final()
         _log.analyze(self.node.id, "+ END", {'key': org_key, 'iter': str(it)})
 
@@ -495,14 +516,46 @@ class Storage(object):
         Add node to storage
         """
         self.set(prefix="node-", key=node.id,
-                  value={"uri": node.external_uri,
-                         "control_uri": node.external_control_uri,
-                         "authz_server": node.authorization.authz_server_id,
+                  value={"uris": node.uris,
+                         "control_uris": [node.external_control_uri],
                          "attributes": {'public': node.attributes.get_public(),
                                         'indexed_public': node.attributes.get_indexed_public(as_list=False)}}, cb=cb)
         self._add_node_index(node)
         # Store all actors on this node in storage
         GlobalStore(node=node, security=Security(node) if security_enabled() else None, verify=False).export()
+        # If node is an authorization server, store information about it in storage
+        _sec_conf = _conf.get('security', 'security_conf')
+        if _sec_conf and 'authorization' in _sec_conf:
+            if ('accept_external_requests' in _sec_conf['authorization'] and
+                    _sec_conf['authorization']['accept_external_requests'] ):
+                _log.debug("Node is an authorization server accepting external requests, list it in storage")
+                #Add node to list of authorization servers accepting external clients
+                self.add_index(['external_authorization_server'], node.id,
+                               root_prefix_level=1, cb=cb)
+                #Add node to list of authorization servers
+                self.add_index(['authorization_server'], node.id,
+                               root_prefix_level=1, cb=cb)
+            elif ('procedure' in _sec_conf['authorization'] and
+                        _sec_conf['authorization']['procedure']=='local' ):
+                _log.debug("Node is a local authorization server NOT accepting external requests, list it in storage")
+                #Add node to list of authorization servers
+                self.add_index(['authorization_server'], node.id, root_prefix_level=1, cb=cb)
+            else:
+                _log.debug("Node is NOT an authorization server")
+        #Store runtime certificate in storage
+        certstring = self._get_runtime_certificate(node)
+        if certstring:
+            self.node.storage.add_index(['certificate',node.id], certstring, root_prefix_level=2, cb=cb)
+
+    def _get_runtime_certificate(self, node):
+        from calvin.utilities.runtime_credentials import RuntimeCredentials
+        try:
+            rt_cred = RuntimeCredentials(node.node_name)
+            certpath, cert, certstr = rt_cred.get_own_cert()
+            return certstr
+        except Exception as err:
+            _log.debug("No runtime credentials, err={}".format(err))
+            return None
 
     def _add_node_index(self, node, cb=None):
         indexes = node.attributes.get_indexed_public()
@@ -519,6 +572,13 @@ class Storage(object):
                 self.add_index(['node', 'capabilities', c], node.id, root_prefix_level=3)
         except:
             _log.debug("Add node capabilities failed", exc_info=True)
+            pass
+        # Add the port property capabilities
+        try:
+            for c in list_port_property_capabilities():
+                self.add_index(['node', 'capabilities', c], node.id, root_prefix_level=3)
+        except:
+            _log.debug("Add node port property capabilities failed", exc_info=True)
             pass
 
     def remove_node_index(self, node, cb=None):
@@ -543,6 +603,18 @@ class Storage(object):
         self.delete(prefix="node-", key=node.id, cb=None if node.attributes.get_indexed_public() else cb)
         if node.attributes.get_indexed_public():
             self._delete_node_index(node, cb=cb)
+        _sec_conf = _conf.get('security', 'security_conf')
+        if _sec_conf and ('authorization' in _sec_conf):
+            if ('accept_external_requests' in _sec_conf['authorization'] and
+                    _sec_conf['authorization']['accept_external_requests'] ):
+                #Remove node from list of authorization servers accepting external clients
+                self.remove_index(['external_authorization_server', 'nodes'], self.node.id, root_prefix_level=2, cb=cb)
+                #Remove node from list of authorization servers
+                self.add_index(['authorization_server'], self.node.id, root_prefix_level=1, cb=cb)
+            elif ('procedure' in _sec_conf['authorization'] and
+                        _sec_conf['authorization']['procedure']=='local' ):
+                #Remove node from list of authorization servers
+                self.remove_index(['authorization_server'], self.node.id, root_prefix_level=1, cb=cb)
 
     def _delete_node_index(self, node, cb=None):
         indexes = node.attributes.get_indexed_public()
@@ -617,6 +689,9 @@ class Storage(object):
             self.add_port(p, node_id, actor.id)
         data["outports"] = outports
         data["is_shadow"] = isinstance(actor, ShadowActor)
+        if actor._replication_data.id:
+            data["replication_id"] = actor._replication_data.id
+            data["replication_master_id"] = actor._replication_data.master
         self.set(prefix="actor-", key=actor.id, value=data, cb=cb)
 
     def get_actor(self, actor_id, cb=None):
@@ -632,7 +707,7 @@ class Storage(object):
         _log.debug("Delete actor id %s" % (actor_id))
         self.delete(prefix="actor-", key=actor_id, cb=cb)
 
-    def add_port(self, port, node_id, actor_id=None, cb=None):
+    def add_port(self, port, node_id, actor_id=None, exhausting_peers=None, cb=None):
         """
         Add port to storage
         """
@@ -642,7 +717,9 @@ class Storage(object):
         data = {"name": port.name, "connected": port.is_connected(),
                 "node_id": node_id, "actor_id": actor_id, "properties": port.properties}
         if port.is_connected():
-            data["peers"] = port.get_peers()
+            if exhausting_peers is None:
+                exhausting_peers = []
+            data["peers"] = [peer for peer in port.get_peers() if peer[1] not in exhausting_peers]
         self.set(prefix="port-", key=port.id, value=data, cb=cb)
 
     def get_port(self, port_id, cb=None):
@@ -656,6 +733,94 @@ class Storage(object):
         Delete port from storage
         """
         self.delete(prefix="port-", key=port_id, cb=cb)
+
+    def add_replica(self, replication_id, actor_id, node_id=None, cb=None):
+        self.add_index(['replicas', 'actors', replication_id], actor_id, root_prefix_level=3, cb=cb)
+        self.add_index(['replicas', 'nodes', replication_id],
+                        self.node.id if node_id is None else node_id, root_prefix_level=3, cb=cb)
+
+    def remove_replica(self, replication_id, actor_id, cb=None):
+        self.remove_index(['replicas', 'actors', replication_id], actor_id, root_prefix_level=3, cb=cb)
+
+    def remove_replica_node(self, replication_id, actor_id, cb=None):
+        # Only remove the node if we are last
+        replica_ids = self.node.rm.list_replication_actors(replication_id)
+        _log.debug("remove_replica_node %s %s" % (actor_id, replica_ids))
+        try:
+            replica_ids.remove(actor_id)
+        except:
+            pass
+        if not replica_ids:
+            _log.debug("remove_replica_node remove %s %s" % (self.node.id, actor_id))
+            self.remove_index(['replicas', 'nodes', replication_id], self.node.id, root_prefix_level=3, cb=cb)
+
+    def get_replica(self, replication_id, cb=None):
+        self.get_index(['replicas', 'actors', replication_id], cb=cb)
+
+    def get_replica_nodes(self, replication_id, cb=None):
+        self.get_index(['replicas', 'nodes', replication_id], cb=cb)
+
+    def add_replication_cb(self, key, value, org_cb, id_, callback_ids):
+        if value == False:
+            del callback_ids[:]
+            if org_cb:
+                return org_cb(False)
+        try:
+            callback_ids.remove(id_)
+        except:
+            return
+        if not callback_ids:
+            if org_cb:
+                return org_cb(True)
+
+    def add_replication(self, replication_data, cb=None):
+        data = replication_data.state(None)
+        instances = data.pop('instances')
+        data.pop('counter')
+        callback_ids = instances + [data['id']]
+        self.set(prefix="replication-", key=data['id'], value=data,
+            cb=CalvinCB(self.add_replication_cb, org_cb=cb, id_=data['id'], callback_ids=callback_ids))
+
+    def remove_replication_cb(self, key, value, org_cb, id_, callback_ids):
+        if value == False:
+            del callback_ids[:]
+            if org_cb:
+                return org_cb(False)
+        try:
+            callback_ids.remove(id_)
+        except:
+            return
+        if not callback_ids:
+            if org_cb:
+                return org_cb(True)
+
+    def remove_replication(self, replication_id, cb=None):
+        callback_ids = [1, 2]
+        self.delete(prefix="replication-", key=replication_id,
+            cb=CalvinCB(self.remove_replication_cb, org_cb=cb, id_=1, callback_ids=callback_ids))
+        self.delete_index(['replicas', 'actors', replication_id], root_prefix_level=3,
+            cb=CalvinCB(self.remove_replication_cb, org_cb=cb, id_=2, callback_ids=callback_ids))
+
+    def get_replication_cb(self, key, value, org_cb, data):
+        if not value and '_sent_cb' not in data:
+            data['_sent_cb'] = True
+            return org_cb(False)
+        if isinstance(value, (list, tuple, set)):
+            # The instances
+            data['instances'] = value
+            data['counter'] = len(value) - 1  # The original is not counted
+        else:
+            # Dictionare with the rest of replication data
+            data.update(value)
+        if 'instances' in data and 'id' in data:
+            return org_cb(True)
+
+    def get_replication(self, replication_id, cb=None):
+        data = {}
+        self.get(prefix="replication-", key=replication_id,
+            cb=CalvinCB(self.get_replication_cb, org_cb=cb, data=data))
+        self.get_replica(replication_id,
+                cb=CalvinCB(self.get_replication_cb, org_cb=cb, data=data))
 
     def index_cb(self, key, value, org_cb, index_items):
         """
@@ -755,6 +920,30 @@ class Storage(object):
         # make copy of indexes since altered in callbacks
         for i in indexes[:]:
             self.remove(prefix="index-", key=i, value=[value],
+                        cb=CalvinCB(self.index_cb, org_cb=cb, index_items=indexes) if cb else None)
+
+    def delete_index(self, index, root_prefix_level=2, cb=None):
+        """
+        Remove index entry in registry
+        index: The multilevel key:
+               a string with slash as delimiter for finer level of index,
+               e.g. node/address/example_street/3/buildingA/level3/room3003,
+               node/affiliation/owner/com.ericsson/Harald,
+               node/affiliation/name/com.ericsson/laptop,
+               index string must been escaped with \/ and \\ for / and \ within levels
+               OR a list of each levels strings
+        root_prefix_level: the top level of the index that can be searched separately,
+               with e.g. =1 then node/address can't be split
+        cb: Callback with signature cb(key=key, value=True/False)
+            note that the key here is without the prefix and
+            value indicate success.
+        """
+
+        indexes = self._index_strings(index, root_prefix_level)
+
+        # make copy of indexes since altered in callbacks
+        for i in indexes[:]:
+            self.delete(prefix="index-", key=i,
                         cb=CalvinCB(self.index_cb, org_cb=cb, index_items=indexes) if cb else None)
 
     def get_index(self, index, cb=None):

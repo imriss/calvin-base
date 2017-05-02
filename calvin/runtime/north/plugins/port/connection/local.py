@@ -19,6 +19,7 @@ from calvin.runtime.north.plugins.port import queue
 import calvin.requests.calvinresponse as response
 from calvin.utilities import calvinlogger
 from calvin.runtime.north.plugins.port.connection.common import BaseConnection
+from calvin.runtime.north.plugins.port import DISCONNECT
 
 _log = calvinlogger.get_logger(__name__)
 
@@ -26,8 +27,8 @@ _log = calvinlogger.get_logger(__name__)
 class LocalConnection(BaseConnection):
     """ Connect two ports that are local"""
 
-    def __init__(self, node, purpose, port, peer_port_meta, callback, **kwargs):
-        super(LocalConnection, self).__init__(node, purpose, port, peer_port_meta, callback)
+    def __init__(self, node, purpose, port, peer_port_meta, callback, factory, **kwargs):
+        super(LocalConnection, self).__init__(node, purpose, port, peer_port_meta, callback, factory)
         self.kwargs = kwargs
 
     def connect(self):
@@ -35,6 +36,9 @@ class LocalConnection(BaseConnection):
                         peer_node_id=self.peer_port_meta.node_id)
         port1 = self.port
         port2 = self.peer_port_meta.port
+
+        self.node.rm.connect_verification(port2.owner.id, port2.id, port1.id, self.node.id)
+
         # Local connect wants the first port to be an inport
         inport, outport = (port1, port2) if port1.direction == 'in' else (port2, port1)
         self._connect_via_local(inport, outport)
@@ -78,28 +82,43 @@ class LocalConnection(BaseConnection):
         self.node.storage.add_port(inport, self.node.id, inport.owner.id)
         self.node.storage.add_port(outport, self.node.id, outport.owner.id)
 
-    def disconnect(self):
+    def disconnect(self, terminate=DISCONNECT.TEMPORARY):
         """ Obtain any missing information to enable disconnecting one peer port and make the disconnect"""
 
         _log.analyze(self.node.id, "+", {'port_id': self.port.id})
-        endpoints = self.port.disconnect(peer_ids=[self.peer_port_meta.port_id])
+        endpoints = self.port.disconnect(peer_ids=[self.peer_port_meta.port_id], terminate=terminate)
         _log.analyze(self.node.id, "+ EP", {'port_id': self.port.id, 'endpoints': endpoints})
-        # Should only be one but maybe future ports will have multiple endpoints for a peer
+        remaining_tokens = {}
+        # Can only be one for the one peer as argument to disconnect, but loop for simplicity
         for ep in endpoints:
+            remaining_tokens.update(ep.remaining_tokens)
             if ep.use_monitor():
                 self.node.monitor.unregister_endpoint(ep)
             ep.destroy()
         _log.analyze(self.node.id, "+ EP DESTROYED", {'port_id': self.port.id})
 
         # Disconnect other end also, which is also local
-        endpoints = self.peer_port_meta.port.disconnect(peer_ids=[self.port.id])
+        terminate_peer = DISCONNECT.EXHAUST_PEER if terminate == DISCONNECT.EXHAUST else terminate
+        endpoints = self.peer_port_meta.port.disconnect(peer_ids=[self.port.id], terminate=terminate_peer)
         _log.analyze(self.node.id, "+ EP PEER", {'port_id': self.port.id, 'endpoints': endpoints})
-        # Should only be one but maybe future ports will have multiple endpoints for a peer
+        peer_remaining_tokens = {}
+        # Can only be one for the one peer as argument to disconnect, but loop for simplicity
         for ep in endpoints:
+            peer_remaining_tokens.update(ep.remaining_tokens)
             if ep.use_monitor():
                 self.node.monitor.unregister_endpoint(ep)
             ep.destroy()
         _log.analyze(self.node.id, "+ DISCONNECTED", {'port_id': self.port.id})
+
+        self.port.exhausted_tokens(peer_remaining_tokens)
+        self.peer_port_meta.port.exhausted_tokens(remaining_tokens)
+
+        # Update storage, the ports are disconnected even if an inport during exhaustion still delivers tokens
+        if terminate:
+            self.node.storage.add_port(self.port, self.node.id, self.port.owner.id,
+                                        exhausting_peers=peer_remaining_tokens.keys())
+            self.node.storage.add_port(self.peer_port_meta.port, self.node.id, self.peer_port_meta.port.owner.id,
+                                        exhausting_peers=remaining_tokens.keys())
 
         try:
             # Remove this peer from the list of peer connections

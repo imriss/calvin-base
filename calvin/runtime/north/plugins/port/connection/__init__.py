@@ -18,6 +18,7 @@ from calvin.actor.actorport import PortMeta
 import calvin.requests.calvinresponse as response
 from calvin.utilities import calvinlogger
 from calvin.runtime.north.plugins.port.connection.common import BaseConnection, PURPOSE
+from calvin.runtime.north.plugins.port import DISCONNECT
 
 _log = calvinlogger.get_logger(__name__)
 
@@ -48,14 +49,14 @@ class ConnectionFactory(object):
 
     def get(self, port, peer_port_meta, callback=None, **kwargs):
         if peer_port_meta.is_local():
-            return LocalConnection(self.node, self.purpose, port, peer_port_meta, callback, **kwargs)
+            return LocalConnection(self.node, self.purpose, port, peer_port_meta, callback, self, **kwargs)
         elif self.purpose == PURPOSE.DISCONNECT and peer_port_meta.node_id is None:
             # A port that miss node info that we want to disconnect is already disconnected
-            return Disconnected(self.node, self.purpose, port, peer_port_meta, callback, **kwargs)
+            return Disconnected(self.node, self.purpose, port, peer_port_meta, callback, self, **kwargs)
         else:
             # Remote connection
             # TODO Currently we only have support for setting up a remote connection via tunnel
-            return TunnelConnection(self.node, self.purpose, port, peer_port_meta, callback, **kwargs)
+            return TunnelConnection(self.node, self.purpose, port, peer_port_meta, callback, self, **kwargs)
 
     def get_existing(self, port_id, callback=None, **kwargs):
         _log.analyze(self.node.id, "+", {'port_id': port_id})
@@ -85,6 +86,7 @@ class ConnectionFactory(object):
         # Make a connection instance aware of all parallel connection instances
         for connection in connections:
             connection.parallel_connections(connections)
+        _log.analyze(self.node.id, "+ DONE", {'port_id': port_id})
         return connections
 
     def init(self):
@@ -92,16 +94,16 @@ class ConnectionFactory(object):
         for class_name in _MODULES.values():
             _log.debug("Init connection method %s" % class_name)
             C = globals()[class_name]
-            data[C.__name__] = C(self.node, PURPOSE.INIT, None, None, None, **self.kwargs).init()
+            data[C.__name__] = C(self.node, PURPOSE.INIT, None, None, None, self, **self.kwargs).init()
         return data
 
 class Disconnected(BaseConnection):
     """ When a peer already is disconnected """
 
-    def __init__(self, node, purpose, port, peer_port_meta, callback, **kwargs):
-        super(Disconnected, self).__init__(node, purpose, port, peer_port_meta, callback)
+    def __init__(self, node, purpose, port, peer_port_meta, callback, factory, **kwargs):
+        super(Disconnected, self).__init__(node, purpose, port, peer_port_meta, callback, factory)
         self.kwargs = kwargs
 
-    def disconnect(self):
+    def disconnect(self, terminate=DISCONNECT.TEMPORARY):
         if self.callback:
             self.callback(status=response.CalvinResponse(True), port_id=self.port.id)

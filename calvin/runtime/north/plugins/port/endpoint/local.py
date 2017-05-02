@@ -16,6 +16,7 @@
 
 from calvin.runtime.north.plugins.port.endpoint.common import Endpoint
 from calvin.runtime.north.plugins.port.queue.common import QueueEmpty, QueueFull
+from calvin.runtime.north.plugins.port import DISCONNECT
 from calvin.utilities.calvinlogger import get_logger
 
 _log = get_logger(__name__)
@@ -24,6 +25,8 @@ _log = get_logger(__name__)
 # Local endpoints
 #
 
+PRESSURE_LENGTH = 20
+
 class LocalInEndpoint(Endpoint):
 
     """docstring for LocalEndpoint"""
@@ -31,15 +34,30 @@ class LocalInEndpoint(Endpoint):
     def __init__(self, port, peer_port):
         super(LocalInEndpoint, self).__init__(port)
         self.peer_port = peer_port
+        self.peer_id = peer_port.id
+        self.pressure_count = 0
+        self.pressure = [0] * PRESSURE_LENGTH
+        self.pressure_last = 0
 
     def is_connected(self):
         return True
 
     def attached(self):
-        self.port.queue.add_reader(self.port.id)
+        self.port.queue.add_reader(self.port.id, self.port.properties)
+        self.port.queue.add_writer(self.peer_id, self.peer_port.properties)
+
+    def detached(self, terminate=DISCONNECT.TEMPORARY):
+        if terminate == DISCONNECT.TERMINATE:
+            self.port.queue.remove_writer(self.peer_port.id)
+        elif terminate == DISCONNECT.EXHAUST:
+            tokens = self.port.queue.exhaust(peer_id=self.peer_port.id, terminate=DISCONNECT.EXHAUST_INPORT)
+            self.remaining_tokens = {self.port.id: tokens}
+        elif terminate == DISCONNECT.EXHAUST_PEER:
+            tokens = self.port.queue.exhaust(peer_id=self.peer_port.id, terminate=DISCONNECT.EXHAUST_PEER_RECV)
+            self.remaining_tokens = {self.port.id: tokens}
 
     def get_peer(self):
-        return ('local', self.peer_port.id)
+        return ('local', self.peer_id)
 
 
 class LocalOutEndpoint(Endpoint):
@@ -50,16 +68,28 @@ class LocalOutEndpoint(Endpoint):
         super(LocalOutEndpoint, self).__init__(port)
         self.peer_port = peer_port
         self.peer_id = peer_port.id
+        self.peer_endpoint = None
 
     def is_connected(self):
         return True
 
     def attached(self):
-        self.port.queue.add_reader(self.peer_id)
+        self.port.queue.add_reader(self.peer_port.id, self.peer_port.properties)
+        self.port.queue.add_writer(self.port.id, self.port.properties)
 
-    def detached(self):
-        # cancel any tentative reads to acked reads
-        self.port.queue.cancel(self.peer_port.id)
+    def detached(self, terminate=DISCONNECT.TEMPORARY):
+        if terminate == DISCONNECT.TEMPORARY:
+            # cancel any tentative reads to acked reads
+            self.port.queue.cancel(self.peer_port.id)
+        elif terminate == DISCONNECT.TERMINATE:
+            self.port.queue.cancel(self.peer_port.id)
+            self.port.queue.remove_reader(self.peer_port.id)
+        elif terminate == DISCONNECT.EXHAUST:
+            tokens = self.port.queue.exhaust(peer_id=self.peer_port.id, terminate=DISCONNECT.EXHAUST_OUTPORT)
+            self.remaining_tokens = {self.port.id: tokens}
+        elif terminate == DISCONNECT.EXHAUST_PEER:
+            tokens = self.port.queue.exhaust(peer_id=self.peer_port.id, terminate=DISCONNECT.EXHAUST_PEER_SEND)
+            self.remaining_tokens = {self.port.id: tokens}
 
     def get_peer(self):
         return ('local', self.peer_id)
@@ -68,11 +98,17 @@ class LocalOutEndpoint(Endpoint):
         return True
 
     def communicate(self, *args, **kwargs):
+        if self.peer_endpoint is None:
+            for e in self.peer_port.endpoints:
+                if e.peer_id == self.port.id:
+                    self.peer_endpoint = e
+                    break
         sent = False
+        nbr = None
         while True:
             try:
                 nbr, token = self.port.queue.com_peek(self.peer_id)
-                self.peer_port.queue.com_write(token, nbr)
+                self.peer_port.queue.com_write(token, self.port.id, nbr)
                 self.port.queue.com_commit(self.peer_id, nbr)
                 sent = True
             except QueueEmpty:
@@ -81,5 +117,11 @@ class LocalOutEndpoint(Endpoint):
             except QueueFull:
                 # Could not write, rollback read
                 self.port.queue.com_cancel(self.peer_id, nbr)
+                if (self.peer_endpoint and
+                        self.peer_endpoint.pressure[(self.peer_endpoint.pressure_count - 1) % PRESSURE_LENGTH] == nbr):
+                    self.peer_endpoint.pressure[self.peer_endpoint.pressure_count % PRESSURE_LENGTH] = nbr
+                    self.peer_endpoint.pressure_count += 1
                 break
+        if self.peer_endpoint and nbr is not None:
+            self.peer_endpoint.pressure_last = nbr
         return sent

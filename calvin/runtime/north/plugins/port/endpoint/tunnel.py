@@ -17,6 +17,7 @@
 from calvin.runtime.north.calvin_token import Token
 from calvin.runtime.north.plugins.port.endpoint.common import Endpoint
 from calvin.runtime.north.plugins.port.queue.common import COMMIT_RESPONSE, QueueEmpty, QueueFull
+from calvin.runtime.north.plugins.port import DISCONNECT
 import time
 from calvin.utilities.calvinlogger import get_logger
 
@@ -26,17 +27,22 @@ _log = get_logger(__name__)
 # Remote tunnel endpoints
 #
 
+PRESSURE_LENGTH = 20
 
 class TunnelInEndpoint(Endpoint):
 
     """docstring for TunnelInEndpoint"""
 
-    def __init__(self, port, tunnel, peer_node_id, peer_port_id, trigger_loop):
+    def __init__(self, port, tunnel, peer_node_id, peer_port_id, peer_port_properties, trigger_loop):
         super(TunnelInEndpoint, self).__init__(port)
         self.tunnel = tunnel
-        self.peer_port_id = peer_port_id
+        self.peer_id = peer_port_id
         self.peer_node_id = peer_node_id
+        self.peer_port_properties = peer_port_properties
         self.trigger_loop = trigger_loop
+        self.pressure_count = 0
+        self.pressure = [0] * PRESSURE_LENGTH
+        self.pressure_last = 0
 
     def __str__(self):
         str = super(TunnelInEndpoint, self).__str__()
@@ -46,11 +52,23 @@ class TunnelInEndpoint(Endpoint):
         return True
 
     def attached(self):
-        self.port.queue.add_reader(self.port.id)
+        self.port.queue.add_reader(self.port.id, self.port.properties)
+        if self.peer_id is not None:
+            self.port.queue.add_writer(self.peer_id, self.peer_port_properties)
+
+    def detached(self, terminate=DISCONNECT.TEMPORARY):
+        if terminate == DISCONNECT.TERMINATE and self.peer_id is not None:
+            self.port.queue.remove_writer(self.peer_id)
+        elif terminate == DISCONNECT.EXHAUST:
+            tokens = self.port.queue.exhaust(peer_id=self.peer_id, terminate=DISCONNECT.EXHAUST_INPORT)
+            self.remaining_tokens = {self.port.id: tokens}
+        elif terminate == DISCONNECT.EXHAUST_PEER:
+            tokens = self.port.queue.exhaust(peer_id=self.peer_id, terminate=DISCONNECT.EXHAUST_PEER_RECV)
+            self.remaining_tokens = {self.port.id: tokens}
 
     def recv_token(self, payload):
         try:
-            r = self.port.queue.com_write(Token.decode(payload['token']), payload['sequencenbr'])
+            r = self.port.queue.com_write(Token.decode(payload['token']), self.peer_id, payload['sequencenbr'])
             if r == COMMIT_RESPONSE.handled:
                 # New token, trigger loop
                 self.trigger_loop()
@@ -63,6 +81,10 @@ class TunnelInEndpoint(Endpoint):
         except QueueFull:
             # Queue full just send NACK
             ok = False
+            if self.pressure[(self.pressure_count - 1) % PRESSURE_LENGTH] != payload['sequencenbr']:
+                self.pressure[self.pressure_count % PRESSURE_LENGTH] = payload['sequencenbr']
+                self.pressure_count += 1
+        self.pressure_last = payload['sequencenbr']
         reply = {
             'cmd': 'TOKEN_REPLY',
             'port_id': payload['port_id'],
@@ -73,21 +95,25 @@ class TunnelInEndpoint(Endpoint):
         self.tunnel.send(reply)
 
     def set_peer_port_id(self, id):
-        self.peer_port_id = id
+        if self.peer_id is None:
+            # If not set previously set it now
+            self.port.queue.add_writer(id, self.peer_port_properties)
+        self.peer_id = id
 
     def get_peer(self):
-        return (self.peer_node_id, self.peer_port_id)
+        return (self.peer_node_id, self.peer_id)
 
 
 class TunnelOutEndpoint(Endpoint):
 
     """docstring for TunnelOutEndpoint"""
 
-    def __init__(self, port, tunnel, peer_node_id, peer_port_id, trigger_loop):
+    def __init__(self, port, tunnel, peer_node_id, peer_port_id, peer_port_properties, trigger_loop):
         super(TunnelOutEndpoint, self).__init__(port)
         self.tunnel = tunnel
         self.peer_id = peer_port_id
         self.peer_node_id = peer_node_id
+        self.peer_port_properties = peer_port_properties
         self.trigger_loop = trigger_loop
         # Keep track of acked tokens, only contains something post call if acks comes out of order
         self.sequencenbrs_acked = []
@@ -103,13 +129,24 @@ class TunnelOutEndpoint(Endpoint):
         return True
 
     def attached(self):
-        self.port.queue.add_reader(self.peer_id)
+        self.port.queue.add_reader(self.peer_id, self.peer_port_properties)
+        self.port.queue.add_writer(self.port.id, self.port.properties)
 
-    def detached(self):
-        # cancel any tentative reads to acked reads
-        # Tunneled transport tokens after last continuous acked token will be resent later,
-        # receiver will just ack them again if rereceived
-        self.port.queue.cancel(self.peer_id)
+    def detached(self, terminate=DISCONNECT.TEMPORARY):
+        if terminate == DISCONNECT.TEMPORARY:
+            # cancel any tentative reads to acked reads
+            # Tunneled transport tokens after last continuous acked token will be resent later,
+            # receiver will just ack them again if rereceived
+            self.port.queue.cancel(self.peer_id)
+        elif terminate == DISCONNECT.TERMINATE:
+            self.port.queue.cancel(self.peer_id)
+            self.port.queue.remove_reader(self.peer_id)
+        elif terminate == DISCONNECT.EXHAUST:
+            tokens = self.port.queue.exhaust(peer_id=self.peer_id, terminate=DISCONNECT.EXHAUST_OUTPORT)
+            self.remaining_tokens = {self.port.id: tokens}
+        elif terminate == DISCONNECT.EXHAUST_PEER:
+            tokens = self.port.queue.exhaust(peer_id=self.peer_id, terminate=DISCONNECT.EXHAUST_PEER_SEND)
+            self.remaining_tokens = {self.port.id: tokens}
 
     def reply(self, sequencenbr, status):
         _log.debug("Reply on port %s/%s/%s [%i] %s" % (self.port.owner.name, self.peer_id, self.port.name, sequencenbr, status))

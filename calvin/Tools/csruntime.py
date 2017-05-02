@@ -21,11 +21,12 @@ import json
 import traceback
 import logging
 import os
-
+import socket
 
 # Calvin related imports must be in functions, to be able to set logfile before imports
 _conf = None
 _log = None
+
 
 
 def parse_arguments():
@@ -68,7 +69,7 @@ Start runtime, compile calvinscript and deploy application.
     argparser.add_argument('-w', '--wait', dest='wait', metavar='sec', default=2, type=int,
                            help='wait for sec seconds before quitting (0 means forever).')
 
-    argparser.add_argument('-x', '--external', metavar='<calvinip>', type=str,
+    argparser.add_argument('-x', '--external', metavar='<calvinip>', action='append', default=[],
                             help="exposed external calvin ip (e.g. outside of container)",
                             dest='ext')
 
@@ -106,18 +107,17 @@ Start runtime, compile calvinscript and deploy application.
     return argparser.parse_args()
 
 
-def runtime(uri, control_uri, attributes=None, dispatch=False):
+def runtime(uris, control_uri, attributes=None, dispatch=False):
     from calvin.utilities.nodecontrol import dispatch_node, start_node
-
     kwargs = {'attributes': attributes} if attributes else {}
     try:
         if dispatch:
-            return dispatch_node(uri=uri, control_uri=control_uri, **kwargs)
+            return dispatch_node(uris=uris, control_uri=control_uri, **kwargs)
         else:
-            start_node(uri, control_uri, **kwargs)
+            start_node(uris, control_uri, **kwargs)
     except Exception as e:
-        print "Starting runtime failed:\n%s" % e
-        return 1
+        print "Starting runtime failed:", e
+        raise
 
 def storage_runtime(uri, control_uri, attributes=None, dispatch=False):
     from calvin.utilities.nodecontrol import dispatch_storage_node, start_storage_node
@@ -131,7 +131,7 @@ def storage_runtime(uri, control_uri, attributes=None, dispatch=False):
 def compile_script(scriptfile, credentials):
     _log.debug("Compiling %s ..." % scriptfile)
     from calvin.Tools.cscompiler import compile_file
-    app_info, issuetracker = compile_file(scriptfile, credentials)
+    app_info, issuetracker = compile_file(scriptfile, False, credentials)
     if issuetracker.error_count:
         fmt = "{type!c}: {reason} {script} {line}:{col}"
         for error in issuetracker.formatted_errors(sort_key='line', custom_format=fmt, script=scriptfile, line=0, col=0):
@@ -185,9 +185,9 @@ def set_loglevel(levels, filename):
             get_logger(module).setLevel(5)
 
 
-def dispatch_and_deploy(app_info, wait, uri, control_uri, attr, credentials):
+def dispatch_and_deploy(app_info, wait, uris, control_uri, attr, credentials):
     from calvin.requests.request_handler import RequestHandler
-    rt, process = runtime(uri, control_uri, attr, dispatch=True)
+    rt, process = runtime(uris, control_uri, attr, dispatch=True)
     app_id = None
     app_id = deploy(rt, app_info, credentials)
     print "Deployed application", app_id
@@ -211,6 +211,148 @@ def set_config_from_args(args):
             _log.debug("Adding ARGUMENTS to config {}={}".format(arg, getattr(args, arg)))
             _conf.set("ARGUMENTS", arg, getattr(args, arg))
 
+def discover(timeout=2, retries=5):
+    import struct
+    from calvin.runtime.south.plugins.storage.twistedimpl.dht.service_discovery_ssdp import SSDPServiceDiscovery,\
+                                                                                            SERVICE_UUID,\
+                                                                                            CA_SERVICE_UUID,\
+                                                                                            SSDP_ADDR,\
+                                                                                            SSDP_PORT,\
+                                                                                            MS_CA
+    _log.info("discover")
+    message = MS_CA
+    socket.setdefaulttimeout(timeout)
+    responses = {}
+    attempt=0
+    while attempt in range(retries) and not bool(responses):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        ttl = struct.pack('b', 1)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
+        try:
+            sent = sock.sendto(message, (SSDP_ADDR,SSDP_PORT))
+            while True:
+                try:
+                    data, server = sock.recvfrom(1000)
+                except socket.timeout:
+                    time.sleep(5)
+                    break
+                else:
+                    responses[server] = data
+                    _log.debug("Received {} from {}".format(data, server))
+        finally:
+            _log.debug("Closing socket")
+            sock.close()
+    return responses.values()
+
+def runtime_certificate(rt_attributes):
+    import copy
+    import requests
+    import sys
+    from calvin.requests.request_handler import RequestHandler
+    from calvin.utilities.attribute_resolver import AttributeResolver
+    from calvin.utilities import calvinconfig
+    from calvin.utilities import calvinuuid
+    from calvin.utilities import runtime_credentials
+    from calvin.utilities import certificate
+    from calvin.utilities import certificate_authority
+    from calvin.runtime.south.plugins.storage.twistedimpl.dht.service_discovery_ssdp import parse_http_response
+    global _conf
+    global _log
+    _conf = calvinconfig.get()
+    security_dir = _conf.get("security","security_dir")
+    ca_control_uri = _conf.get("security","ca_control_uri")
+    domain_name = _conf.get("security","domain_name")
+    storage_type = _conf.get("global","storage_type")
+    enrollment_password = _conf.get("security","enrollment_password")
+    is_ca =_conf.get("security","certificate_authority")
+    if domain_name:
+        _log.debug("Runtime security enabled (i.e., domain is configured)")
+        #AttributeResolver tranforms the attributes, so make a deepcopy instead
+        rt_attributes_cpy = copy.deepcopy(rt_attributes)
+        attributes = AttributeResolver(rt_attributes_cpy)
+        node_name = attributes.get_node_name_as_str()
+        nodeid = calvinuuid.uuid("")
+        runtime = runtime_credentials.RuntimeCredentials(node_name, domain_name,
+                                                       security_dir=security_dir,
+                                                       nodeid=nodeid,
+                                                       enrollment_password=enrollment_password)
+        certpath, cert, certstr = runtime.get_own_cert()
+        if not cert:
+            csr_path = os.path.join(runtime.runtime_dir, node_name + ".csr")
+            if is_ca == "True":
+                _log.debug("No runtime certificate, but node is a CA, just sign csr, domain={}".format(domain_name))
+                ca = certificate_authority.CA(domain=domain_name,
+                                              security_dir=security_dir)
+                #Write challenge password to file, not very usefull for the CA runtime
+                #but currently the challenge verification is required for all runtimes
+                try:
+                    with open(csr_path +".challenge_password", 'w') as csr_fd:
+                        csr_fd.write(enrollment_password)
+                except Exception as err:
+                    _log.exception("Failed to write challenge password to file, err={}".format(err))
+                    raise
+                cert_path = ca.sign_csr(csr_path)
+                runtime.store_own_cert(certpath=cert_path, security_dir=security_dir)
+
+            else:
+                _log.debug("No runtime certicificate can be found, send CSR to CA")
+                ca_cert_str = runtime.get_truststore(type=certificate.TRUSTSTORE_TRANSPORT)[0][0]
+                #Encrypt CSR with CAs public key (to protect enrollment password)
+                rsa_encrypted_csr = runtime.cert_enrollment_encrypt_csr(csr_path, ca_cert_str)
+                truststore_dir = certificate.get_truststore_path(type=certificate.TRUSTSTORE_TRANSPORT,
+                                                                 security_dir=security_dir)
+                ca_cert_path = os.path.join(truststore_dir, os.listdir(truststore_dir)[0])
+                request_handler = RequestHandler(verify=ca_cert_path)
+                ca_control_uri = _conf.get('security','certificate_authority_control_uri')
+                ca_control_uris = []
+                if ca_control_uri:
+                    _log.debug("CA control_uri in config={}".format(ca_control_uri))
+                    ca_control_uris.append(ca_control_uri)
+                elif storage_type in ["dht","securedht"]:
+                    _log.debug("Find CA via SSDP")
+                    responses = discover()
+                    for response in responses:
+                        cmd, headers = parse_http_response(response)
+                        if 'location' in headers:
+                            ca_control_uri, ca_node_id = headers['location'].split('/node/')
+                            ca_control_uri = ca_control_uri.replace("http","https")
+                            ca_control_uris.append(ca_control_uri)
+                            _log.debug("CA control_uri={}, node_id={}".format(ca_control_uri, ca_node_id))
+                else:
+                    _log.error("There is no runtime certificate. For automatic certificate enrollment using proxy storage,"
+                                    "the CA control uri must be configured in the calvin configuration ")
+                    raise Exception("There is no runtime certificate. For automatic certificate enrollment using proxy storage,"
+                                    "the CA control uri must be configured in the calvin configuration ")
+                cert_available=False
+                # Loop through all CA:s that responded until hopefully one signs our CSR
+                # Potential improvement would  be to have domain name in response and only try
+                # appropriate CAs
+                i=0
+                while not cert_available and i<len(ca_control_uris):
+                    certstr=None
+                    #Repeatedly (maximum 10 attempts) send CSR to CA until a certificate is returned (this to remove the requirement of the CA 
+                    #node to be be the first node to start)
+                    j=0
+                    while not certstr and j<10:
+                        try:
+                            certstr = request_handler.sign_csr_request(ca_control_uris[i], rsa_encrypted_csr)['certificate']
+                        except requests.exceptions.RequestException as err:
+                            time_to_sleep = 1 + j*j*j
+                            _log.debug("RequestException, CSR not accepted or CA not up and running yet, sleep {} seconds and try again, err={}".format(time_to_sleep, err))
+                            time.sleep(time_to_sleep)
+                            j=j+1
+                            pass
+                        else:
+                            cert_available = True
+                    i = i+1
+                #TODO: check that everything is ok with signed cert, e.g., check that the CA domain
+                # matches the expected and that the CA cert is trusted
+                runtime.store_own_cert(certstring=certstr, security_dir=security_dir)
+        else:
+            _log.debug("Runtime certificate available")
+    else:
+        _log.debug("No runtime security enabled")
+
 
 def main():
     args = parse_arguments()
@@ -221,7 +363,6 @@ def main():
 
     # Need to be before other calvin calls to set the common log file
     set_loglevel(args.loglevel, args.logfile)
-
     set_config_from_args(args)
 
     app_info = None
@@ -285,6 +426,7 @@ def main():
     if app_info:
         dispatch_and_deploy(app_info, args.wait, uris, control_uri, runtime_attr, credentials_)
     else:
+        runtime_certificate(runtime_attr)
         if args.storage:
             storage_runtime(uris, control_uri, runtime_attr, dispatch=False)
         else:

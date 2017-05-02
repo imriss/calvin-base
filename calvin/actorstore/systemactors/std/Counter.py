@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition
+from calvin.actor.actor import Actor, manage, condition, stateguard
 
 
 class Counter(Actor):
@@ -24,18 +24,21 @@ class Counter(Actor):
       integer : Integer
     """
 
-    @manage(['count'])
+    @manage(['count', 'stopped'])
     def init(self):
         self.count = 0
+        self.stopped = False
 
+    @stateguard(lambda self: not self.stopped)
     @condition(action_output=['integer'])
     def cnt(self):
         self.count += 1
-        return ActionResult(production=(self.count, ))
+        return (self.count, )
 
     action_priority = (cnt,)
 
-    def report(self):
+    def report(self, **kwargs):
+        self.stopped = kwargs.get("stopped", self.stopped)
         return self.count
 
     test_args = []

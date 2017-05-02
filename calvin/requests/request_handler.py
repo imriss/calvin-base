@@ -44,9 +44,10 @@ ACTOR_PATH = '/actor/{}'
 ACTORS = '/actors'
 ACTOR_DISABLE = '/actor/{}/disable'
 ACTOR_MIGRATE = '/actor/{}/migrate'
+ACTOR_REPLICATE = '/actor/{}/replicate'
 APPLICATION_PATH = '/application/{}'
 APPLICATION_MIGRATE = '/application/{}/migrate'
-ACTOR_PORT = '/actor/{}/{}'
+ACTOR_PORT = '/actor/{}/port/{}'
 ACTOR_REPORT = '/actor/{}/report'
 SET_PORT_PROPERTY = '/set_port_property'
 APPLICATIONS = '/applications'
@@ -60,8 +61,10 @@ METER_PATH = '/meter/{}'
 METER_PATH_TIMED = '/meter/{}/timed'
 METER_PATH_AGGREGATED = '/meter/{}/aggregated'
 METER_PATH_METAINFO = '/meter/{}/metainfo'
-
-
+CSR_REQUEST = '/certificate_authority/certificate_signing_request'
+AUTHENTICATION = '/authentication'
+AUTHENTICATION_USERS_DB = '/authentication/users_db'
+AUTHENTICATION_GROUPS_DB = '/authentication/groups_db'
 def get_runtime(value):
     if isinstance(value, basestring):
         return RT(value)
@@ -77,20 +80,36 @@ class RT(object):
 
 class RequestHandler(object):
 
-    def __init__(self):
+    def __init__(self,verify=None):
         self.future_responses = []
+        self.verify=verify
+        self.credentials = None
+
+    def set_credentials(self, credentials):
+        if ('user' in credentials) and ('password' in credentials):
+            self.credentials=(credentials['user'], credentials['password'])
+        else:
+            #TODO remove printing of the credentials in the log
+            _log.error("Incorrectly formated credentials supplied, credentials={}".format(credentials))
+            self.credentials=None
 
     def check_response(self, response, success=range(200, 207), key=None):
         if isinstance(response, Response):
             if response.status_code in success:
-                try:
-                    r = json.loads(response.text)
-                    return r if key is None else r[key]
-                except:
-                    _log.debug("Failed to parse response '{}' as json".format(response.text))
-                    return None
+                if response.status_code == "204":
+                    return
+                if response.headers.get("content-type") == "application/json":
+                    try:
+                        r = json.loads(response.text)
+                        return r if key is None else r[key]
+                    except ValueError:
+                        _log.error("Content-Type is %s, but failed to decode '{}' as json", response.text)
+                        return None
+                else:
+                    # No content type return the text
+                    return response.text
             # When failed raise exception
-            raise Exception("%d%s" % (response.status_code, ("\n" + response.text) if response.text else ""))
+            raise Exception("%d%s" % (response.status_code, ("\n" + repr(response.text)) if response.text else ""))
         else:
             # We have a async Future just return it
             response._calvin_key = key
@@ -100,18 +119,27 @@ class RequestHandler(object):
 
     def _send(self, rt, timeout, send_func, path, data=None):
         rt = get_runtime(rt)
-        if data is not None:
-            return send_func(rt.control_uri + path, timeout=timeout, data=json.dumps(data))
+        _log.debug("Sending request %s, %s, %s", send_func, rt.control_uri + path, json.dumps(data))
+        if self.verify and data is not None:
+            return send_func(rt.control_uri + path, timeout=timeout, data=json.dumps(data), auth=self.credentials, verify=self.verify)
+        elif self.verify and data is None:
+            return send_func(rt.control_uri + path, timeout=timeout, auth=self.credentials, verify=self.verify)
+        elif data is not None:
+            return send_func(rt.control_uri + path, timeout=timeout, data=json.dumps(data), auth=self.credentials)
         else:
-            return send_func(rt.control_uri + path, timeout=timeout)
+            return send_func(rt.control_uri + path, timeout=timeout, auth=self.credentials)
 
-    def _get(self, rt, timeout, async, path):
+    def _get(self, rt, timeout, async, path, headers="", data=None):
         req = session if async else requests
-        return self._send(rt, timeout, req.get, path)
+        return self._send(rt, timeout, req.get, path, data)
 
     def _post(self, rt, timeout, async, path, data=None):
         req = session if async else requests
         return self._send(rt, timeout, req.post, path, data)
+
+    def _put(self, rt, timeout, async, path, data=None):
+        req = session if async else requests
+        return self._send(rt, timeout, req.put, path, data)
 
     def _delete(self, rt, timeout, async, path, data=None):
         req = session if async else requests
@@ -125,8 +153,11 @@ class RequestHandler(object):
         r = self._get(rt, timeout, async, NODE_PATH.format(node_id))
         return self.check_response(r)
 
-    def quit(self, rt, timeout=DEFAULT_TIMEOUT, async=False):
-        r = self._delete(rt, timeout, async, NODE)
+    def quit(self, rt, method=None, timeout=DEFAULT_TIMEOUT, async=False):
+        if method is None:
+            r = self._delete(rt, timeout, async, NODE)
+        else:
+            r = self._delete(rt, timeout, async, NODE_PATH.format(method))
         return self.check_response(r)
 
     def get_nodes(self, rt, timeout=DEFAULT_TIMEOUT, async=False):
@@ -193,13 +224,14 @@ class RequestHandler(object):
         r = self._post(rt, timeout, async, CONNECT, data)
         return self.check_response(r)
 
-    def disconnect(self, rt, actor_id=None, port_name=None, port_dir=None, port_id=None, timeout=DEFAULT_TIMEOUT,
-                   async=False):
+    def disconnect(self, rt, actor_id=None, port_name=None, port_dir=None, port_id=None, terminate=None, 
+                   timeout=DEFAULT_TIMEOUT, async=False):
         data = {
             'actor_id': actor_id,
             'port_name': port_name,
             'port_dir': port_dir,
-            'port_id': port_id
+            'port_id': port_id,
+            'terminate': terminate
         }
         r = self._post(rt, timeout, async, DISCONNECT, data)
         return self.check_response(r)
@@ -212,6 +244,22 @@ class RequestHandler(object):
     def migrate(self, rt, actor_id, dst_id, timeout=DEFAULT_TIMEOUT, async=False):
         data = {'peer_node_id': dst_id}
         path = ACTOR_MIGRATE.format(actor_id)
+        r = self._post(rt, timeout, async, path, data)
+        return self.check_response(r)
+
+    def replicate(self, rt, actor_id, dst_id=None, dereplicate=False, exhaust=False, requirements=None, timeout=DEFAULT_TIMEOUT, async=False):
+        data = {}
+        if dst_id:
+            data['peer_node_id'] = dst_id
+        if dereplicate:
+            data['dereplicate'] = dereplicate
+        if exhaust:
+            data['exhaust'] = exhaust
+        if requirements is not None:
+            data['requirements'] = requirements
+        if not data:
+            data = None
+        path = ACTOR_REPLICATE.format(actor_id)
         r = self._post(rt, timeout, async, path, data)
         return self.check_response(r)
 
@@ -250,9 +298,12 @@ class RequestHandler(object):
         r = self._post(rt, timeout, async, SET_PORT_PROPERTY, data)
         return self.check_response(r)
 
-    def report(self, rt, actor_id, timeout=DEFAULT_TIMEOUT, async=False):
+    def report(self, rt, actor_id, kwargs=None, timeout=DEFAULT_TIMEOUT, async=False):
         path = ACTOR_REPORT.format(actor_id)
-        r = self._get(rt, timeout, async, path)
+        if kwargs:
+            r = self._post(rt, timeout, async, path, kwargs)
+        else:
+            r = self._get(rt, timeout, async, path)
         return self.check_response(r)
 
     def get_applications(self, rt, timeout=DEFAULT_TIMEOUT, async=False):
@@ -342,10 +393,16 @@ class RequestHandler(object):
         r = self._post(rt, timeout, async, path, data)
         return self.check_response(r)
 
+    def dump_storage(self, rt, timeout=DEFAULT_TIMEOUT, async=False):
+        r = self._get(rt, timeout, async, "/dumpstorage")
+        return self.check_response(r)
+
     def async_response(self, response):
         try:
             self.future_responses.remove(response)
-        except:
+        except Exception as e:
+            _log.warning("Async responce exception %s", e)
+            _log.debug("Async responce exception %s", e, exc_info=True)
             pass
         r = response.result()
         return self.check_response(r, response._calvin_success, response._calvin_key)
@@ -361,10 +418,29 @@ class RequestHandler(object):
         if exceptions:
             raise Exception(max(exceptions))
 
+    def __getattr__(self, name):
+        if name.startswith("async_"):
+            func = name[6:]
+            return partial(getattr(self, func), async=True)
+        else:
+            raise AttributeError("Unknown request handler attribute %s" % name)
 
-# Generate async_* versions of all functions in RequestHandler with async argument set to True
-for func_name, func in inspect.getmembers(RequestHandler, predicate=inspect.ismethod):
-    if ((hasattr(func, '__code__') and 'async' in func.__code__.co_varnames and
-            func.__name__ not in ['_get', '_post', '_delete'])
-            or func.__name__ == 'peer_setup'):
-        setattr(RequestHandler, 'async_' + func_name, partial(func, async=True))
+    def sign_csr_request(self, rt, csr, timeout=DEFAULT_TIMEOUT, async=False):
+        data = {'csr': csr}
+        r = self._post(rt, timeout, async, CSR_REQUEST, data=data)
+        return self.check_response(r)
+
+    def get_users_db(self, rt, timeout=DEFAULT_TIMEOUT, async=False):
+        r = self._get(rt, timeout, async, AUTHENTICATION_USERS_DB)
+        result = self.check_response(r)
+        if 'users_db' in result:
+            return result['users_db']
+        else:
+            _log.error("Failed to fetch users_db")
+            return None
+
+    def post_users_db(self, rt, users_db, timeout=DEFAULT_TIMEOUT, async=False):
+        data = {'users_db': users_db}
+        r = self._put(rt, timeout, async, AUTHENTICATION_USERS_DB, data=data)
+        return self.check_response(r)
+

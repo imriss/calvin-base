@@ -16,7 +16,7 @@
 
 # encoding: utf-8
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 from calvin.runtime.north.calvin_token import EOSToken, ExceptionToken
 
 class List(Actor):
@@ -25,7 +25,7 @@ class List(Actor):
     Create a list.
 
     Consumes 'n' tokens  to produce a list, 'n' defaults to 1. If 'n' is zero or negative,
-    consumes tokens until EOS encountered (variable list length). 
+    consumes tokens until EOS encountered (variable list length).
     The optional arguments pre_list and post_list are used to prepend and extend the list before
     delivering the final list.
     Will produce an ExceptionToken if EOS is encountered when n > 0, or if an ExceptionToken is
@@ -37,12 +37,11 @@ class List(Actor):
       list: a list of consumed items
     """
 
-    def exception_handler(self, action, args, context):
-        exception = args[context['exceptions']['item'][0]]
-        if self.n or type(exception) is not EOSToken:
+    def exception_handler(self, action, args):
+        if self.n or type(args[0]) is not EOSToken:
             self._list = ExceptionToken()
         self.done = True
-        return ActionResult()
+
 
     @manage(['n', '_list', 'done'])
     def init(self, n=1, pre_list=None, post_list=None):
@@ -52,22 +51,22 @@ class List(Actor):
         self.post_list = post_list
         self.done = False
 
+    @stateguard(lambda self: not self.n and not self.done)
     @condition(['item'], [])
-    @guard(lambda self, item: not self.n and not self.done)
     def add_item_EOS(self, item):
         self._list.append(item)
-        return ActionResult()
 
+
+    @stateguard(lambda self: self.n and not self.done)
     @condition(['item'], [])
-    @guard(lambda self, item: self.n and not self.done)
     def add_item(self, item):
         self._list.append(item)
         if len(self._list) == self.n:
             self.done = True
-        return ActionResult()
 
+
+    @stateguard(lambda self: self.done)
     @condition([], ['list'])
-    @guard(lambda self: self.done)
     def produce_list(self):
         if isinstance(self._list, list):
             res = (self.pre_list if self.pre_list else []) + self._list +(self.post_list if self.post_list else [])
@@ -75,7 +74,7 @@ class List(Actor):
             res = self._list
         self.done = False
         self._list = []
-        return ActionResult(production=(res, ))
+        return (res, )
 
     action_priority = (produce_list, add_item, add_item_EOS)
 

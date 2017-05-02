@@ -16,7 +16,7 @@
 
 # encoding: utf-8
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 from calvin.runtime.north.calvin_token import EOSToken, ExceptionToken
 from copy import deepcopy
 
@@ -39,35 +39,38 @@ class SetValue(Actor):
       container:  a modified container
     """
 
-    def exception_handler(self, action, args, context):
-        return ActionResult(production=(ExceptionToken(),))
+    def exception_handler(self, action, args):
+        return (ExceptionToken(),)
 
     @manage()
     def init(self):
         pass
 
-    def _type_mismatch(self, container, key):
+    def _check_type_mismatch(self, container, key):
         t_cont = type(container)
         t_key = type(key)
-        return (t_cont is list and t_key is not int) or (t_cont is dict and not isinstance(key, basestring))
+        mismatch = (t_cont is list and t_key is not int) or (t_cont is dict and not isinstance(key, basestring))
+        if mismatch:
+            raise Exception()
+
+    def _set_value(self, container, key, value):
+        keylist = key if type(key) is list else [key]
+        try:
+            res = container
+            for key in keylist[:-1]:
+                self._check_type_mismatch(res, key)
+                res = res[key]
+            self._check_type_mismatch(res, keylist[-1])
+            res[keylist[-1]] = value
+        except:
+            container = ExceptionToken()
+        return container
 
 
     @condition(['container', 'key', 'value'], ['container'])
     def set_value(self, data, key, value):
-        keylist = key if type(key) is list else [key]
-        container = deepcopy(data)
-        try:
-            res = container
-            for key in keylist[:-1]:
-                if self._type_mismatch(res, key):
-                    raise Exception()
-                res = res[key]
-            if self._type_mismatch(res, keylist[-1]):
-                raise Exception()
-            res[keylist[-1]] = value
-        except:
-            container = ExceptionToken()
-        return ActionResult(production=(container, ))
+        container = self._set_value(deepcopy(data), key, value)
+        return (container, )
 
     action_priority = (set_value, )
 

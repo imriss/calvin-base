@@ -26,6 +26,7 @@ import tempfile
 import time
 import random
 import shutil
+import json
 from calvin.utilities import confsort
 import OpenSSL
 from cryptography.x509 import load_pem_x509_certificate
@@ -95,6 +96,14 @@ class CsrDeniedMalformed(Exception):
     """A CSR is denied as it is malformed."""
     pass
 
+class CsrMissingPassword(Exception):
+    """A CSR is denied as an no challenge password was supplied"""
+    pass
+
+class CsrIncorrectPassword(Exception):
+    """A CSR is denied as an incorrect challenge password was supplied"""
+    pass
+
 
 class StoreFailed(Exception):
     """Storing failed."""
@@ -158,7 +167,7 @@ class CA():
                               'runtimes_dir': '$dir/runtimes',
                               'email_in_dn': 'no',
                               'x509_extensions': 'usr_cert',
-                              'copy_extensions': 'none',
+                              'copy_extensions': 'copy',
                               'certs': '$dir/certs',
                               'default_days': '365',
                               'policy': 'policy_any',
@@ -168,10 +177,10 @@ class CA():
                               'name_opt': 'ca_default',
                               'crl': '$dir/crl.pem',
                               'default_md': 'sha256'},
-               'v3_ca': {'subjectKeyIdentifier': 'hash',
+               'v3_ca': {'basicConstraints':'CA:true',
+                        'subjectKeyIdentifier': 'hash',
                          'authorityKeyIdentifier':
-                         'keyid:always,issuer:always',
-                         'basicConstraints': 'CA:true'},
+                         'keyid:always,issuer:always'},
                'usr_cert': {'subjectKeyIdentifier': 'hash',
                             'authorityKeyIdentifier': 'keyid,issuer',
                             'basicConstraints': 'CA:false'},
@@ -185,14 +194,16 @@ class CA():
     # TODO Find out why the policy does not match equal org names.
 
     def __init__(self, domain, commonName=None, security_dir=None, force=False, readonly=False):
+        _log.debug("__init__")
         self.configfile = None
         self.commonName = commonName or 'runtime'
         self.config = ConfigParser.SafeConfigParser()
         self.config.optionxform = str
+        self.enrollment_challenge_db = {}
         os.umask(0077)
         self.domain = domain
         _log.debug("CA init")
-        security_path = _conf.get("security", "security_path")
+        security_path = _conf.get("security", "security_dir")
         if security_dir:
             self.configfile = os.path.join(security_dir, domain, "openssl.conf")
         elif security_path:
@@ -209,8 +220,8 @@ class CA():
             self.configuration = self.parse_opensslconf()
             _log.debug("Configuration already exists")
 
-            print "Configuration already exists " \
-                  "using {}".format(self.configfile)
+#            print "Configuration already exists " \
+#                  "using {}".format(self.configfile)
         else:
             _log.debug("Configuration does not exist, let's create CA")
             self.new_opensslconf()
@@ -221,15 +232,18 @@ class CA():
                                         force=False,
                                         readonly=False)
             except:
-                _log.error("creation of new CA credentials failed")
-            print "Made new configuration at " \
-                  "{}".format(self.configfile)
+                _log.error("Creation of new CA credentials failed")
+                raise
+#            print "Made new configuration at " \
+#                  "{}".format(self.configfile)
+            self.cert_enrollment_update_db_file()
 
     def new_ca_credentials(self, security_dir=None, force=False, readonly=False):
         """
         Generate keys, files and certificate
         for the new CA
         """
+        from os import urandom
         _log.debug("new_ca_credentials")
         outpath = self.configuration["CA_default"]["new_certs_dir"]
         private = self.configuration["CA_default"]["private_dir"]
@@ -259,20 +273,20 @@ class CA():
         serialfd = open(self.configuration["CA_default"]["serial"], 'w')
         serialfd.write("1000")
         serialfd.close()
-        _log.debug("new_ca_credentials")
 
         organization = self.domain
         commonname = self.commonName
         subject = "/O={}/CN={}".format(organization, commonname)
-
-        log = subprocess.Popen(["openssl", "rand",
-                                "-out", password_file, "20"],
-                               stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE)
-        stdout, stderr = log.communicate()
-        if log.returncode != 0:
-            raise IOError(stderr)
-
+        # Generate a password for protection of the private key,
+        # store it in the password file
+        password = self.generate_password(20)
+        try:
+            with open(password_file,'w') as fd:
+                fd.write(password)
+        except Exception as err:
+            _log.err("Failed to write CA password to file")
+            raise
+        # Generate keys and CA certificate
         log = subprocess.Popen(["openssl", "req",
                                 "-new",
                                 "-config", self.configfile,
@@ -301,7 +315,6 @@ class CA():
 
         for section in self.__class__.DEFAULT.keys():
             self.config.add_section(section)
-            print "[{}]".format(section)
             for option in self.__class__.DEFAULT[section]:
                 if option == "0.organizationName":
                     value = self.domain
@@ -312,12 +325,11 @@ class CA():
                 else:
                     value = self.__class__.DEFAULT[section][option]
                 self.config.set(section, option, value)
-                print "\t{}={}".format(option, value)
 
         try:
             os.makedirs(directory, 0700)
         except OSError, e:
-            print e
+            _log.error("Failed to create directory, err={}".format(e))
         with open(self.configfile, 'wb') as configfd:
             self.config.write(configfd)
             configfd.close()
@@ -405,7 +417,6 @@ class CA():
 
         """
         return certificate.export_cert(self.configuration["CA_default"]["certificate"], path)
-        cert_file = self.configuration["CA_default"]["certificate"]
 
     #Is this needed for CA???#Is this needed for CA????
     def sign_file(self, file):
@@ -421,6 +432,7 @@ class CA():
                     -passin file:$private_dir/ca_password
                      "$file"
         """
+        _log.debug("sign_file: file={}".format(file))
         private = self.configuration["CA_default"]["private_dir"]
         cert_file = self.configuration["CA_default"]["certificate"]
         private_key = self.configuration["CA_default"]["private_key"]
@@ -444,6 +456,43 @@ class CA():
             raise IOError(stderr)
         return sign_file
 
+    def decrypt_encrypted_csr(self, encrypted_enrollment_request=None, encrypted_enrollment_request_path=None):
+        """
+        In case an enrollment password is attached to the
+        the CSR, the entire CSR is encrypted using
+        the CAs public key. This funciton decrypts the
+        CSR using the CAs private key
+        """
+        #TODO: currenlty, the same key pair is used for
+        #signing certificates as for encrypting/decrypting
+        #CSRs during enrollment, different key pairs should be
+        #used
+        if not encrypted_enrollment_request and encrypted_enrollment_request_path:
+            try:
+                with open(encrypted_enrollment_request_path, 'r') as fd:
+                    encrypted_enrollment_request = json.load(fd)
+            except EnvironmentError as err:
+                _log.exception("Failed to write encrypted CSR to file, err={}".format(err))
+                raise
+        elif not encrypted_enrollment_request:
+            raise CsrMissingPassword()
+
+        private = self.configuration["CA_default"]["private_dir"]
+        password_file = os.path.join(private, "ca_password")
+        try:
+            with open(self.configuration["CA_default"]["private_key"], 'r') as fd:
+                private_key = fd.read()
+            with open(password_file, 'r') as fd:
+                password=fd.read()
+        except EnvironmentError as err:
+            _log.exception("Failed to read private key or password")
+            raise
+        plaintext = certificate.decrypt_object_with_RSA(private_key=private_key,
+                                            password=password,
+                                            encrypted_object=encrypted_enrollment_request
+                                           )
+        return plaintext
+
     def store_csr(self, csr):
         """
         Store `csr` in newcerts location from configuration.
@@ -463,7 +512,44 @@ class CA():
             raise StoreFailed(err)
         return filepath
 
-    def validate_csr(self, csr):
+    def store_csr_with_enrollment_password(self, plaintext):
+        """
+        Store `csr` in newcerts location from configuration.
+        Raise store failed if there was problems storing.
+        Return path to csr-file.
+        """
+        plaintext_json = json.loads(plaintext)
+        challenge_password = plaintext_json['challenge_password']
+        csr = plaintext_json['csr']
+        new_cert = self.configuration["CA_default"]["new_certs_dir"]
+        load_csr = OpenSSL.crypto.load_certificate_request
+        try:
+            csrx509 = load_csr(OpenSSL.crypto.FILETYPE_PEM, csr)
+            subject = csrx509.get_subject()
+            filename = "{}.csr".format(subject.commonName)
+            filepath = os.path.join(new_cert, filename)
+            with open(filepath, 'w') as csr_fd:
+                csr_fd.write(csr)
+            with open(filepath +".challenge_password", 'w') as csr_fd:
+                csr_fd.write(challenge_password)
+        except EnvironmentError as err:
+            raise StoreFailed(err)
+        return filepath
+
+    def validate_challenge_password(self, csr_path, common_name):
+        try:
+            with open(csr_path + ".challenge_password",'r') as fd:
+                challenge_password=fd.read()
+        except EnvironmentError as err:
+            _log.exception("Failed to open CSR challenge password file")
+            challenge_password = None
+        if not self.enrollment_challenge_db:
+            self.cert_enrollment_load_db_file()
+
+        if self.enrollment_challenge_db and self.enrollment_challenge_db[common_name]['password'] != challenge_password:
+            raise CsrIncorrectPassword(err)
+
+    def validate_csr(self, csr_path):
         """
         Validate that the `csr` matches with configuration.
         Raise CsrDeniedConfiguration if the CSR did not satisfy the
@@ -471,7 +557,13 @@ class CA():
         Raise CsrDeniedMalformed if the csr could not be read at all.
         Raise CertDeniedConfiguration is the CSR key is too short.
         """
-        _log.debug("ca.validate_csr %s" % csr)
+        _log.debug("ca.validate_csr %s" % csr_path)
+        try:
+            with open(csr_path) as fd:
+                csr=fd.read()
+        except EnvironmentError as err:
+            _log.exception("Failed to open CSR file, err={}".format(err))
+            raise
         try:
             csrx509 = certificate.verify_certstr_with_policy(csr)
         except (OpenSSL.crypto.Error, IOError), err:
@@ -482,6 +574,12 @@ class CA():
             subject = csrx509.get_subject()
             common_name = subject.commonName
             domain = subject.organizationName
+            try:
+                self.validate_challenge_password(csr_path, common_name)
+            except Exception as err:
+                _log.exception("Failed to validate challenge password")
+                #TODO: sent appropriate reply to requester
+                raise
             try:
                 dnQualifier = subject.dnQualifier
             except:
@@ -495,11 +593,12 @@ class CA():
             # The openssl policy can also do this ...
         except (OpenSSL.crypto.Error), err:
             raise CsrDeniedConfiguration(err)
+        return csrx509
 
     def sign_csr(self, request):
         """
         Sign a certificate request.
-        Req is the name of a Certificate Signing Request in $new_certs_dir.
+        request: is the path to a Certificate Signing Request.
 
         Equivalent of:
         mkdir -p $certs
@@ -508,6 +607,11 @@ class CA():
                    -out $certs/runtime.pem
                    -passin file:$private_dir/ca_password
         """
+        _log.debug("sign_csr")
+        try:
+            csrx509 = self.validate_csr(request)
+        except:
+            raise
         private = self.configuration["CA_default"]["private_dir"]
         certspath = self.configuration["CA_default"]["certs"]
         new_certs_dir = self.configuration["CA_default"]["new_certs_dir"]
@@ -559,9 +663,16 @@ class CA():
             stdout, stderr = log.communicate("y\r\n")
             if log.returncode != 0:
                 raise IOError(stderr)
-
-            fp = certificate.fingerprint(signed)
-            newcert = "{}.pem".format(fp.replace(":", "")[-40:])
+            try:
+                with open(signed,'ab') as rt_fd:
+                    with open(self.configuration["CA_default"]["certificate"],'rb') as ca_fd:
+                        rt_fd.write(ca_fd.read())
+            except Exception as err:
+                _log.debug("Failed to append ca cert, err={}".format(err))
+                raise
+            subject = csrx509.get_subject()
+            dnQualifier = subject.dnQualifier
+            newcert = "{}.pem".format(dnQualifier)
         except:
             _log.exception("Sign request failed")
             newcert = None
@@ -577,8 +688,6 @@ class CA():
             raise IOError("Could not sign certificate")
 
         newkeyname = os.path.join(new_certs_dir, newcert)
-        print(signed)
-        print(newkeyname)
         os.rename(signed, newkeyname)
         return newkeyname
 
@@ -598,7 +707,7 @@ class CA():
         is_ca = _conf.get("security","certificate_authority")
         if is_ca=="True":
             security_dir = _conf.get("security", "security_path")
-            domain_name = _conf.get("security", "security_domain_name")
+            domain_name = _conf.get("security", "domain_name")
             if security_dir:
                 cert_conf_file = os.path.join(security_dir,domain_name,"openssl.conf")
             else:
@@ -644,4 +753,46 @@ class CA():
 
 
 
+    def generate_password(self, length):
+        from os import urandom
+        _log.debug("generate_password, length={}".format(length))
+        if not isinstance(length, int) or length < 8:
+            raise ValueError("Password must be longer")
+
+        chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ123456789!#%&/()=?[]{}"
+        return "".join(chars[ord(c) % len(chars)] for c in urandom(length))
+
+
+    def cert_enrollment_add_new_runtime(self, node_name):
+
+        _log.debug("add_new_runtime_enrollment_password for node_name={}".format(node_name))
+        if not self.enrollment_challenge_db:
+            self.cert_enrollment_load_db_file()
+        random_password = self.generate_password(20)
+        self.enrollment_challenge_db[node_name] = {'password':random_password}
+        self.cert_enrollment_update_db_file()
+        return random_password
+
+    def cert_enrollment_load_db_file(self):
+        import json
+        enrollment_challenge_db_path = os.path.join(self.configuration["CA_default"]["dir"],"enrollment_challenge_db.json")
+        try:
+            with open(enrollment_challenge_db_path,'r') as f:
+                self.enrollment_challenge_db = json.load(f)
+        except Exception as exc:
+            _log.exception("Failed to load Certificate Enrollment Authority password database")
+            #TODO: temporarily disable password verification if no file can be opened
+            #Longterm, we should raise exception instead
+#            raise
+            self.enrollment_challenge_db = None
+
+    def cert_enrollment_update_db_file(self):
+        import json
+        enrollment_challenge_db_path = os.path.join(self.configuration["CA_default"]["dir"],"enrollment_challenge_db.json")
+        try:
+            with open(enrollment_challenge_db_path,'w') as f:
+                json.dump(self.enrollment_challenge_db, f)
+        except Exception as exc:
+            _log.exception("Failed to create/update Certificate Enrollment Authority password database")
+            raise
 

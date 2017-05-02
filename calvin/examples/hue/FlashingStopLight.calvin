@@ -20,7 +20,7 @@ component PhilipsHue(address, username, lightno) on, saturation, brightness, hue
 }
 
 component StopLight(address, username, lightno) state -> status {
-    select: std.Deselect()
+    select: flow.Deselect()
     light : PhilipsHue(address=address, username=username, lightno=lightno)
 
     true > light.on
@@ -59,7 +59,7 @@ component FlashStopLight(address, username, lightno, interval) -> {
     light : StopLight(address=address, username=username, lightno=lightno)
     on : std.Trigger(tick=0.0, data=true)
     off: std.Trigger(tick=0.0, data=false)
-    alternate : std.Alternate()
+    alternate : flow.Alternate2()
     pacer : std.ClassicDelay(delay=interval)
 
     on.data > alternate.token_1

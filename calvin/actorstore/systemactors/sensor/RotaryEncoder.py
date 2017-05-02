@@ -14,14 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 
 
 class RotaryEncoder(Actor):
 
     """
-        Read a knob to see which way it turned.
-        
+    Read a knob to see which way it turned.
+
     Outputs:
         direction: clockwise or anti-clockwise
         button: True if button was pressed
@@ -34,23 +34,23 @@ class RotaryEncoder(Actor):
     def setup(self):
         self.use("calvinsys.sensors.rotary_encoder", shorthand="knob")
         self['knob'].start()
-        
+
     def will_migrate(self):
         self['knob'].stop()
-        
+
     def did_migrate(self):
         self.setup()
-    
+
+    @stateguard(lambda self: self['knob'].was_pressed())
     @condition([], ['button'])
-    @guard(lambda self: self['knob'].was_pressed())
     def button(self):
-        return ActionResult(production=(True,))
-        
+        return (True,)
+
+    @stateguard(lambda self: self['knob'].was_turned())
     @condition([], ['direction'])
-    @guard(lambda self: self['knob'].was_turned())
     def turn(self):
         direction = "clockwise" if self['knob'].read() == 1 else "anti-clockwise"
-        return ActionResult(production=(direction,))
+        return (direction,)
 
     action_priority = (turn, button,)
     requires =  ['calvinsys.sensors.rotary_encoder']

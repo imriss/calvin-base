@@ -24,7 +24,7 @@ def read_description(fname):
 
 
 setup(name='calvin',
-      version='0.6',
+      version='0.7',
       url="http://github.com/EricssonResearch/calvin-base",
       license="Apache Software License",
       author="Ericsson Research",
@@ -48,7 +48,9 @@ setup(name='calvin',
           'cryptography>1.0.0,<1.3.0',
           'passlib==1.6.5',
           'PyJWT==1.4.0',
-          'service-identity==16.0.0'
+          'service-identity==16.0.0',
+          'ndg-httpsclient==0.4.2',
+          'pyasn1==0.1.9'
       ],
       description="Calvin is a distributed runtime and development framework for an actor based dataflow"
                   "programming methodology",

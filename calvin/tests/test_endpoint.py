@@ -33,8 +33,8 @@ class TestLocalEndpoint(unittest.TestCase):
         self.peer_port = OutPort("peer_port", Mock())
         self.local_in = LocalInEndpoint(self.port, self.peer_port)
         self.local_out = LocalOutEndpoint(self.peer_port, self.port)
-        self.port.set_queue(queue.fanout_fifo.FanoutFIFO(5))
-        self.peer_port.set_queue(queue.fanout_fifo.FanoutFIFO(5))
+        self.port.set_queue(queue.fanout_fifo.FanoutFIFO({'queue_length': 4, 'direction': "in"}, {}))
+        self.peer_port.set_queue(queue.fanout_fifo.FanoutFIFO({'queue_length': 4, 'direction': "out"}, {}))
         self.peer_port.attach_endpoint(self.local_out)
         self.port.attach_endpoint(self.local_in)
 
@@ -43,14 +43,14 @@ class TestLocalEndpoint(unittest.TestCase):
         assert self.local_out.is_connected
 
     def test_communicate(self):
-        self.peer_port.queue.write(0)
-        self.peer_port.queue.write(1)
+        self.peer_port.queue.write(0, None)
+        self.peer_port.queue.write(1, None)
 
         for e in self.peer_port.endpoints:
             e.communicate()
 
         assert self.peer_port.tokens_available(4)
-        self.local_out.port.queue.write(2)
+        self.local_out.port.queue.write(2, None)
         assert not self.peer_port.tokens_available(4)
         assert self.peer_port.tokens_available(3)
 
@@ -63,7 +63,7 @@ class TestLocalEndpoint(unittest.TestCase):
         for i in range(3):
             assert self.port.queue.peek(self.port.id) == i
         assert self.port.tokens_available(0, self.port.id)
-        self.port.queue.commit()
+        self.port.queue.commit(self.port.id)
         assert self.port.tokens_available(0, self.port.id)
 
     def test_get_peer(self):
@@ -80,11 +80,11 @@ class TestTunnelEndpoint(unittest.TestCase):
         self.trigger_loop = Mock()
         self.node_id = 123
         self.peer_node_id = 456
-        self.tunnel_in = TunnelInEndpoint(self.port, self.tunnel, self.peer_node_id, self.peer_port.id, self.trigger_loop)
-        self.tunnel_out = TunnelOutEndpoint(self.peer_port, self.tunnel, self.node_id, self.port.id, self.trigger_loop)
-        self.port.set_queue(queue.fanout_fifo.FanoutFIFO(5))
+        self.tunnel_in = TunnelInEndpoint(self.port, self.tunnel, self.peer_node_id, self.peer_port.id, {}, self.trigger_loop)
+        self.tunnel_out = TunnelOutEndpoint(self.peer_port, self.tunnel, self.node_id, self.port.id, {}, self.trigger_loop)
+        self.port.set_queue(queue.fanout_fifo.FanoutFIFO({'queue_length': 4, 'direction': "in"}, {}))
         self.port.attach_endpoint(self.tunnel_in)
-        self.peer_port.set_queue(queue.fanout_fifo.FanoutFIFO(5))
+        self.peer_port.set_queue(queue.fanout_fifo.FanoutFIFO({'queue_length': 4, 'direction': "out"}, {}))
         self.peer_port.attach_endpoint(self.tunnel_out)
 
     def test_recv_token(self):

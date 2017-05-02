@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 from calvin.runtime.north.calvin_token import EOSToken, ExceptionToken
 
 
@@ -37,26 +37,26 @@ class LineJoin(Actor):
         self.lines = []
         self.text = None
 
-    def exception_handler(self, action, args, context):
+    def exception_handler(self, action, args):
         # FIXME: Check that action is append and args is EOSToken
         #        if not, call super's exception_handler
         #        Similarly, if self.text is not None => raise
         self.text = self.delim.join(self.lines)
         self.lines = []
-        return ActionResult()
+        
 
+    @stateguard(lambda self: self.text is not None)
     @condition([], ['text'])
-    @guard(lambda self: self.text is not None)
     def produce(self):
         text = self.text
         self.text = None
-        return ActionResult(production=(text,))
+        return (text,)
 
+    @stateguard(lambda self: self.text is None)
     @condition(['line'], [])
-    @guard(lambda self, token: self.text is None)
     def append(self, token):
         self.lines.append(token)
-        return ActionResult()
+        
 
     action_priority = (produce, append, )
 

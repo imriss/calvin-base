@@ -1,6 +1,7 @@
 import time
 import datetime
 
+
 class Time(object):
 
     def timestamp(self):
@@ -19,6 +20,9 @@ class Time(object):
             'timezone': None
         }
         return retval
+
+    def strftime(self, formating):
+        return time.strftime(formating, time.gmtime())
 
 
 def register(node = None, actor = None):

@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 from calvin.utilities.calvinlogger import get_logger
 
 _log = get_logger(__name__)
@@ -23,7 +23,7 @@ _log = get_logger(__name__)
 class OpenWeatherMap(Actor):
     """
     Fetch weather data for given city.
-    
+
     Input:
       city : city to get
     Output:
@@ -46,14 +46,14 @@ class OpenWeatherMap(Actor):
         self.use('calvinsys.attribute.private', shorthand="attr")
         # Requires an api key
         self.api_key = self['attr'].get("/web/openweathermap.com/appid")
-        
+
 
     def reset_request(self):
         self.received_status = False
         if self.request:
             self['http'].finalize(self.request)
             self.request = None
-        
+
 
     def filter_weather_data(self, data):
         result = {}
@@ -65,37 +65,37 @@ class OpenWeatherMap(Actor):
         temperature = int(10*temperature)/10.0 # One decimal
         result['temperature'] = temperature
         return result
-        
+
+    @stateguard(lambda self: self.api_key and self.request is None)
     @condition(action_input=['city'])
-    @guard(lambda self, _: self.api_key and self.request is None)
     def new_request(self, city):
         url = "http://api.openweathermap.org/data/2.5/weather"
         params = [("q", city), ("appid", self.api_key)]
         header = {}
         self.request = self['http'].get(url, params, header)
-        return ActionResult()
+        
 
+    @stateguard(lambda self: self.request and not self.received_status and self['http'].received_headers(self.request))
     @condition(action_output=['status'])
-    @guard(lambda self: self.request and not self.received_status and self['http'].received_headers(self.request))
     def handle_headers(self):
         status = self['http'].status(self.request)
         self.received_status = status
-        return ActionResult(production=(status,))
+        return (status,)
 
+    @stateguard(lambda self: self.request and self.received_status == 200 and self['http'].received_body(self.request))
     @condition(action_output=['forecast'])
-    @guard(lambda self: self.request and self.received_status == 200 and self['http'].received_body(self.request))
     def handle_body(self):
         body = self['http'].body(self.request)
         forecast = self['json'].loads(body)
         forecast = self.filter_weather_data(forecast)
         self.reset_request()
-        return ActionResult(production=(forecast,))
+        return (forecast,)
 
+    @stateguard(lambda self: self.request and self.received_status and self.received_status != 200)
     @condition()
-    @guard(lambda self: self.request and self.received_status and self.received_status != 200)
     def handle_empty_body(self):
         self.reset_request()
-        return ActionResult()
+        
 
     action_priority = (handle_body, handle_empty_body, handle_headers, new_request)
     requires = ['calvinsys.network.httpclienthandler', 'calvinsys.native.python-json', "calvinsys.attribute.private"]

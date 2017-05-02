@@ -18,15 +18,18 @@
 # Parsers
 from calvin.runtime.south.plugins.storage import dht, securedht
 from calvin.runtime.north.plugins.storage.proxy import StorageProxy
+from calvin.runtime.north.plugins.storage.storage_dict_local import StorageLocal
 
 def get(type_, node=None):
     if type_ == "dht":
-        return dht.AutoDHTServer()
+        return dht.AutoDHTServer(node.id, node.control_uri)
     elif type_ == "securedht":
-        return securedht.AutoDHTServer()
+        return securedht.AutoDHTServer(node.id, node.control_uri, node.runtime_credentials)
     elif type_ == "proxy":
         return StorageProxy(node)
     elif type_ == "local":
         return None
+    elif type_ == "local_dict":
+        return StorageLocal(node)
 
     raise Exception("Parser {} requested is not supported".format(type_))

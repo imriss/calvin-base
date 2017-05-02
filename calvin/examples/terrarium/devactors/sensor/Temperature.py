@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, condition
+from calvin.actor.actor import Actor, condition
 
 
 class Temperature(Actor):
@@ -43,7 +43,7 @@ class Temperature(Actor):
         result = {}
         result['value'] = int(self.sensor.get_temperature())
         result['unit'] = "C"
-        return ActionResult(production=(result, ))
+        return (result, )
 
     action_priority = (get_temperature, )
     requires = ["calvinsys.sensors.environmental"]

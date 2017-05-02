@@ -15,7 +15,7 @@
 # limitations under the License.
 
 # import re
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 
 
 class RegexMatch(Actor):
@@ -48,25 +48,25 @@ class RegexMatch(Actor):
         self.did_match = m is not None
         self.result = m.groups()[0] if m and m.groups() else text
 
+    @stateguard(lambda self: self.result is None)
     @condition(['text'], [])
-    @guard(lambda self, text: self.result is None)
     def match(self, text):
         self.perform_match(str(text))
-        return ActionResult()
+        
 
+    @stateguard(lambda self: self.result is not None and self.did_match)
     @condition([], ['match'])
-    @guard(lambda self: self.result is not None and self.did_match)
     def output_match(self):
         result = self.result
         self.result = None
-        return ActionResult(production=(result,))
+        return (result,)
 
+    @stateguard(lambda self: self.result is not None and not self.did_match)
     @condition([], ['no_match'])
-    @guard(lambda self: self.result is not None and not self.did_match)
     def output_no_match(self):
         result = self.result
         self.result = None
-        return ActionResult(production=(result,))
+        return (result,)
 
     action_priority = (match, output_match, output_no_match)
     requires = ['calvinsys.native.python-re']

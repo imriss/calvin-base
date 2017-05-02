@@ -19,22 +19,26 @@ import time
 import json
 from random import randint
 from calvin.csparser import cscompile as compiler
+from calvin.csparser.dscodegen import calvin_dscodegen
 from calvin.runtime.north.appmanager import Deployer
 from calvin.runtime.north import metering
 from calvin.utilities.calvinlogger import get_logger
 from calvin.utilities.calvin_callback import CalvinCB
 from calvin.utilities.attribute_resolver import format_index_string
 from calvin.runtime.south.plugins.async import server_connection, async
+from calvin.runtime.north.plugins.port import DISCONNECT
 from urlparse import urlparse
 from calvin.requests import calvinresponse
-from calvin.utilities.security import security_enabled
+from calvin.utilities.security import Security, security_enabled
 from calvin.actorstore.store import DocumentationStore
 from calvin.utilities import calvinuuid
 from calvin.utilities.issuetracker import IssueTracker
-
 _log = get_logger(__name__)
 
 uuid_re = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+# Base
+re_get_base_doc = re.compile(r"GET /\sHTTP/1")
 
 control_api_doc = ""
 
@@ -116,6 +120,16 @@ re_get_node_id = re.compile(r"GET /id\sHTTP/1")
 
 control_api_doc += \
     """
+    GET /capabilities
+    Get capabilities of this calvin node
+    Response status code: OK
+    Response: list of capabilities
+"""
+re_get_node_capabilities = re.compile(r"GET /capabilities\sHTTP/1")
+
+
+control_api_doc += \
+    """
     GET /nodes
     List nodes in network (excluding self) known to self
     Response status code: OK
@@ -131,7 +145,7 @@ control_api_doc += \
     Response:
     {
         "attributes": {...},
-        "control_uri": "http://<address>:<controlport>",
+        "control_uri": "http(s)://<address>:<controlport>",
         "uri": "calvinip://<address>:<port>"
     }
 """
@@ -189,7 +203,7 @@ control_api_doc += \
     DELETE /application/{application-id}
     Stop application (only applications launched from this node)
     Response status code: OK, NOT_FOUND, INTERNAL_ERROR
-    Response: none
+    Response: [<actor_id>, ...] when error list of actors (replicas) in application not destroyed
 """
 re_del_application = re.compile(r"DELETE /application/(APP_" + uuid_re + "|" + uuid_re + ")\sHTTP/1")
 
@@ -249,7 +263,7 @@ control_api_doc += \
     Response status code: OK or NOT_FOUND
     Response: Depends on actor
 """
-re_get_actor_report = re.compile(r"GET /actor/(ACTOR_" + uuid_re + "|" + uuid_re + ")/report\sHTTP/1")
+re_actor_report = re.compile(r"(?:GET|POST) /actor/(ACTOR_" + uuid_re + "|" + uuid_re + ")/report\sHTTP/1")
 
 control_api_doc += \
     """
@@ -291,6 +305,15 @@ re_post_actor_disable = re.compile(r"POST /actor/(ACTOR_" + uuid_re + "|" + uuid
 """
 re_get_port = re.compile(
     r"GET /actor/(ACTOR_" + uuid_re + "|" + uuid_re + ")/port/(PORT_" + uuid_re + "|" + uuid_re + ")\sHTTP/1")
+
+control_api_doc += \
+    """
+    POST /actor/{actor-id}/replicate
+    ONLY FOR TEST. Will replicate an actor directly
+    Response status code: OK or NOT_FOUND
+    Response: {'actor_id': <replicated actor instance id>}
+"""
+re_post_actor_replicate = re.compile(r"POST /actor/(ACTOR_" + uuid_re + "|" + uuid_re + ")/replicate\sHTTP/1")
 
 # control_api_doc += \
 """
@@ -449,12 +472,14 @@ re_post_disconnect = re.compile(r"POST /disconnect\sHTTP/1")
 
 control_api_doc += \
     """
-    DELETE /node
+    DELETE /node{/now|/migrate}
     Stop (this) calvin node
+     now: stop the runtime without handling actors on the runtime [default]
+     migrate: migrate any actors before stopping the runtime
     Response status code: ACCEPTED
     Response: none
 """
-re_delete_node = re.compile(r"DELETE /node\sHTTP/1")
+re_delete_node = re.compile(r"DELETE /node(?:/(now|migrate))?\sHTTP/1")
 
 control_api_doc += \
     """
@@ -596,6 +621,15 @@ re_get_storage = re.compile(r"GET /storage/([0-9a-zA-Z\.\-/_]*)\sHTTP/1")
 
 control_api_doc += \
     """
+    GET /dumpstorage
+    Dump storage to temporary file in /tmp when available
+    Response status code: OK
+    Response: none
+"""
+re_dump_storage = re.compile(r"GET /dumpstorage\sHTTP/1")
+
+control_api_doc += \
+    """
     POST /storage/{prefix-key}
     Store value under prefix-key
     Body:
@@ -606,6 +640,16 @@ control_api_doc += \
     Response: none
 """
 re_post_storage = re.compile(r"POST /storage/([0-9a-zA-Z\.\-/_]*)\sHTTP/1")
+
+control_api_doc += \
+    """
+    POST /certiticate_authority/certificate_signing_request
+    Send CSR to CA, that creates a x509 certificate and returns it
+    Response status code: OK or INTERNAL_ERROR
+    Response:
+    {"certificate":<value>}
+"""
+re_post_certificate_signing_request = re.compile(r"POST /certificate_authority/certificate_signing_request\sHTTP/1")
 
 control_api_doc += \
     """
@@ -718,7 +762,7 @@ control_api_doc += \
     Response: Available communication options
 """
 # re_options = re.compile(r"OPTIONS /[0-9a-z/-_.]*\sHTTP/1.1")
-re_options = re.compile(r"OPTIONS /[^\s]*\sHTTP/1.1")
+re_options = re.compile(r"OPTIONS /[^\s]*\sHTTP/1")
 
 _calvincontrol = None
 
@@ -762,6 +806,9 @@ class CalvinControl(object):
     LOG_APPLICATION_DESTROY = 6
     LOG_LINK_CONNECTED = 7
     LOG_LINK_DISCONNECTED = 8
+    LOG_ACTOR_REPLICATE = 9
+    LOG_ACTOR_DEREPLICATE = 10
+    LOG_LOG_MESSAGE = 11
 
     def __init__(self):
         self.node = None
@@ -774,14 +821,17 @@ class CalvinControl(object):
         self.tunnel_server = None
         self.tunnel_client = None
         self.metering = None
+        self.security = None
 
         # Set routes for requests
         self.routes = [
+            (re_get_base_doc, self.handle_get_base_doc),
             (re_get_actor_doc, self.handle_get_actor_doc),
             (re_post_log, self.handle_post_log),
             (re_delete_log, self.handle_delete_log),
             (re_get_log, self.handle_get_log),
             (re_get_node_id, self.handle_get_node_id),
+            (re_get_node_capabilities, self.handle_get_node_capabilities),
             (re_get_nodes, self.handle_get_nodes),
             (re_get_node, self.handle_get_node),
             (re_post_node_attribute_indexed_public, self.handle_post_node_attribute_indexed_public),
@@ -793,9 +843,10 @@ class CalvinControl(object):
             (re_get_actors, self.handle_get_actors),
             (re_get_actor, self.handle_get_actor),
             (re_del_actor, self.handle_del_actor),
-            (re_get_actor_report, self.handle_get_actor_report),
+            (re_actor_report, self.handle_actor_report),
             (re_post_actor_migrate, self.handle_actor_migrate),
             (re_post_actor_disable, self.handle_actor_disable),
+            (re_post_actor_replicate, self.handle_actor_replicate),
             (re_get_port, self.handle_get_port),
             (re_get_port_state, self.handle_get_port_state),
             (re_post_connect, self.handle_connect),
@@ -813,7 +864,9 @@ class CalvinControl(object):
             (re_delete_index, self.handle_delete_index),
             (re_get_index, self.handle_get_index),
             (re_get_storage, self.handle_get_storage),
+            (re_dump_storage, self.handle_dump_storage),
             (re_post_storage, self.handle_post_storage),
+            (re_post_certificate_signing_request,self.handle_post_certificate_signing_request),
             (re_get_authentication_users_db, self.handle_get_authentication_users_db),
             (re_edit_authentication_users_db, self.handle_edit_authentication_users_db),
             (re_get_authentication_groups_db, self.handle_get_authentication_groups_db),
@@ -826,12 +879,92 @@ class CalvinControl(object):
             (re_options, self.handle_options)
         ]
 
+    def authentication_decorator(func):
+        def _exit_with_error(issue_tracker):
+            """Helper method to generate a proper error"""
+            _log.debug("CalvinControl::_exit_with_error  add 401 to issuetracker")
+            issue_tracker.add_error("UNAUTHORIZED", info={'status':401})
+            return
+
+        def _handle_authentication_decision(authentication_decision, arguments=None, security=None, org_cb=None, issue_tracker=None):
+            _log.debug("CalvinControl::_handle_authentication_decision, authentication_decision={}".format(authentication_decision))
+            if not authentication_decision:
+                _log.error("Authentication failed")
+                # This error reason is detected in calvin control and gives proper REST response
+                # Authentication failure currently results in no subject attrbutes, which might still give access to the resource
+                # , an alternative approach is to always deny access for authentication failure. Not sure what is best.
+                _exit_with_error(issue_tracker)
+            try:
+                security.check_security_policy(
+                    CalvinCB(_handle_policy_decision,
+                             arguments=arguments,
+                             org_cb=org_cb,
+                             issue_tracker=issue_tracker),
+                    element_type="control_interface",
+                    element_value=arguments['func'].func_name
+                )
+            except Exception as exc:
+                _log.exception("Failed to check security policy, exc={}".format(exc))
+                return _handle_policy_decision(access_decision=False, arguments=arguments, org_cb=org_cb, issue_tracker=issue_tracker) 
+
+        def _handle_policy_decision(access_decision, arguments=None, org_cb=None, issue_tracker=None):
+            _log.debug("CalvinControl::_handle_policy_decision:\n\tauthorization_decision={}\n\targuments={}\n\ttorg_cb={}".format(access_decision, arguments, org_cb))
+            if not access_decision:
+                _log.error("Access denied")
+                # This error reason is detected in calvin control and gives proper REST response
+                _exit_with_error(issue_tracker)
+            if issue_tracker.error_count:
+                four_oh_ones = [e for e in issue_tracker.errors(sort_key='reason')]
+                errors = issue_tracker.errors(sort_key='reason')
+                for e in errors:
+                    if 'status' in e and e['status'] == 401:
+                        _log.error("Security verification of script failed")
+                        status = calvinresponse.UNAUTHORIZED
+                        body = None
+                        arguments['self'].send_response(arguments['handle'], arguments['connection'], body, status=status)
+                        return
+            return arguments['func'](arguments['self'], arguments['handle'], arguments['connection'], arguments['match'], arguments['data'], arguments['hdr'])
+
+        def inner(self, handle, connection, match, data, hdr):
+            from base64 import b64decode
+            _log.debug("authentication_decorator::inner, arguments were:"
+                       "\n\tfunc={}"
+                       "\n\thandle={}"
+                       "\n\tconnection={}"
+                       "\n\tmatch={}"
+                       "\n\tdata={}"
+                       "\n\thdr={}".format(func, handle, connection, match, data, hdr))
+
+            issue_tracker = IssueTracker()
+            credentials = None
+            arguments={'func':func, 'self':self, 'handle':handle, 'connection':connection, 'match':match, 'data':data, 'hdr':hdr}
+            try:
+                if 'authorization' in hdr:
+                    cred = b64decode(hdr['authorization'].strip('Basic ')).split(':')
+                    credentials ={'user':cred[0], 'password':cred[1]}
+                if data and 'sec_credentials' in data:
+                    deploy_credentials = data['sec_credentials']
+            except TypeError as err:
+                _log.error("inner: code not decode credentials in header")
+                pass
+            try:
+                self.security.authenticate_subject(
+                    credentials,
+                    callback=CalvinCB(_handle_authentication_decision, arguments=arguments, security=self.security, org_cb=None, issue_tracker=issue_tracker)
+                )
+            except Exception as exc:
+                _log.exception("Failed to authenticate the subject, exc={}".format(exc))
+                _exit_with_error(issue_tracker)
+
+        return inner
+
     def start(self, node, uri, tunnel=False, external_uri=None):
         """ If not tunnel, start listening on uri and handle http requests.
             If tunnel, setup a tunnel to uri and handle requests.
         """
         self.metering = metering.get_metering()
         self.node = node
+        self.security = Security(self.node)
         schema, _ = uri.split(':', 1)
         if tunnel:
             # Connect to tunnel server
@@ -844,9 +977,9 @@ class CalvinControl(object):
                 self.external_host = urlparse(external_uri).hostname
             else:
                 self.external_host = self.host
-            _log.info("Control API listening on: %s:%s" % (self.host, self.port))
+            _log.info("Control API trying to listening on: %s:%s" % (self.host, self.port))
 
-            self.server = server_connection.ServerProtocolFactory(self.handle_request, "http")
+            self.server = server_connection.ServerProtocolFactory(self.handle_request, "http", node_name=node.node_name)
             self.server.start(self.host, self.port)
 
             # Create tunnel server
@@ -880,11 +1013,18 @@ class CalvinControl(object):
                 self.route_request(handle, connection, command, headers, data)
 
     def route_request(self, handle, connection, command, headers, data):
+        if self.node.quitting:
+            # Answer internal error on all requests while quitting, assume client can handle that
+            # TODO: Answer permantely moved (301) instead with header Location: <another-calvin-runtime>???
+            self.send_response(handle, connection, None, status=calvinresponse.INTERNAL_ERROR)
+            return
         try:
+            issuetracker = IssueTracker()
             found = False
             for route in self.routes:
                 match = route[0].match(command)
                 if match:
+                    credentials = None
                     if data:
                         data = json.loads(data)
                     _log.debug("Calvin control handles:%s\n%s\n---------------" % (command, data))
@@ -895,15 +1035,23 @@ class CalvinControl(object):
             if not found:
                 _log.error("No route found for: %s\n%s" % (command, data))
                 self.send_response(handle, connection, None, status=404)
-        except:
+        except Exception as e:
+            _log.info("Failed to parse request", exc_info=e)
             self.send_response(handle, connection, None, status=calvinresponse.BAD_REQUEST)
 
-    def send_response(self, handle, connection, data, status=200):
+    def send_response(self, handle, connection, data, status=200, content_type=None):
         """ Send response header text/html
         """
+        content_type = content_type or "Content-Type: application/json"
+        content_type += "\n"
+
+        # No data return 204 no content
+        if data is None and status in range(200, 207):
+            status = 204
+
         header = "HTTP/1.0 " + \
             str(status) + " " + calvinresponse.RESPONSE_CODES[status] + \
-            "\n" + ("" if data is None else "Content-Type: application/json\n") + \
+            "\n" + ("" if data is None else content_type ) + \
             "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\n" + \
             "Access-Control-Allow-Origin: *\r\n" + "\n"
 
@@ -932,18 +1080,70 @@ class CalvinControl(object):
                 self.tunnel_client.send(msg)
 
     def storage_cb(self, key, value, handle, connection):
-        self.send_response(handle, connection, None if value is None else json.dumps(value),
-                           status=calvinresponse.NOT_FOUND if None else calvinresponse.OK)
+        missing = value is None or value is False
+        self.send_response(handle, connection, None if missing else json.dumps(value),
+                           status=calvinresponse.NOT_FOUND if missing else calvinresponse.OK)
 
+    @authentication_decorator
+    def handle_get_base_doc(self, handle, connection, match, data, hdr):
+        """ Query get all docs
+        """
+
+        lines = control_api_doc.split("\n")
+
+        want_json = 'accept' in hdr and hdr['accept'] == "application/json"
+
+        if not want_json:
+            data = """
+            <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+            <html>
+            <title>Calvin control API</title>
+            <body>
+            <xmp style="display:none;">"""
+
+            block = []
+            for line in lines:
+                if not line and block:
+                    data += '- __' + block.pop(1).strip().replace('_', '\_') + '__' + "\n"
+                    data += "```\n" + "\n".join(s for s in block) + "\n```\n"
+                    block =  []
+                elif line:
+                    # same block
+                    block.append(line)
+            data += """
+            </xmp>
+            <script src="//strapdownjs.com/v/0.2/strapdown.js"></script>
+            </body>
+            </html>
+            """
+            self.send_response(handle, connection, data, status=200, content_type="Content-Type: text/HTML")
+        else:
+            data = []
+            block = []
+            for line in lines:
+                if not line and block:
+                    item = {'title': block.pop(1).strip().replace('_', '\_').strip()}
+                    item['doc_rows'] = [ a.strip() for a in block ]
+                    data.append(item)
+                    block =  []
+                elif line:
+                    # same block
+                    block.append(line)
+
+            self.send_response(handle, connection, json.dumps(data), status=200)
+
+    @authentication_decorator
     def handle_get_actor_doc(self, handle, connection, match, data, hdr):
         """ Query ActorStore for documentation
         """
         path = match.group(1)
         what = '.'.join(path.strip('/').split('/'))
         ds = DocumentationStore()
+        what = None if not what else what
         data = ds.help_raw(what)
-        self.send_response(handle, connection, json.dumps(data))
+        self.send_response(handle, connection, data)
 
+    @authentication_decorator
     def handle_post_log(self, handle, connection, match, data, hdr):
         """ Create log session
         """
@@ -972,6 +1172,10 @@ class CalvinControl(object):
                         events.append(self.LOG_ACTOR_DESTROY)
                     elif event == 'actor_migrate':
                         events.append(self.LOG_ACTOR_MIGRATE)
+                    elif event == 'actor_replicate':
+                        events.append(self.LOG_ACTOR_REPLICATE)
+                    elif event == 'actor_dereplicate':
+                        events.append(self.LOG_ACTOR_DEREPLICATE)
                     elif event == 'application_new':
                         events.append(self.LOG_APPLICATION_NEW)
                     elif event == 'application_destroy':
@@ -980,6 +1184,8 @@ class CalvinControl(object):
                         events.append(self.LOG_LINK_CONNECTED)
                     elif event == 'link_disconnected':
                         events.append(self.LOG_LINK_DISCONNECTED)
+                    elif event == 'log_message':
+                        events.append(self.LOG_LOG_MESSAGE)
                     else:
                         status = calvinresponse.BAD_REQUEST
                         break
@@ -993,6 +1199,7 @@ class CalvinControl(object):
                            if status == calvinresponse.OK else None,
                            status=status)
 
+    @authentication_decorator
     def handle_delete_log(self, handle, connection, match, data, hdr):
         """ Delete log session
         """
@@ -1003,6 +1210,7 @@ class CalvinControl(object):
             status = calvinresponse.NOT_FOUND
         self.send_response(handle, connection, None, status=status)
 
+    @authentication_decorator
     def handle_get_log(self, handle, connection, match, data, hdr):
         """ Get log stream
         """
@@ -1012,10 +1220,17 @@ class CalvinControl(object):
         else:
             self.send_response(handle, connection, None, calvinresponse.NOT_FOUND)
 
+    #Can't be access controlled, as it is needed to find authorization server
+#    @authentication_decorator
     def handle_get_node_id(self, handle, connection, match, data, hdr):
         """ Get node id from this node
         """
         self.send_response(handle, connection, json.dumps({'id': self.node.id}))
+
+    def handle_get_node_capabilities(self, handle, connection, match, data, hdr):
+        """ Get capabilities from this node
+        """
+        self.send_response(handle, connection, json.dumps(self.node._calvinsys.list_capabilities()))
 
     def handle_peer_setup(self, handle, connection, match, data, hdr):
         _log.analyze(self.node.id, "+", data)
@@ -1029,11 +1244,13 @@ class CalvinControl(object):
             data = None
         self.send_response(handle, connection, data, status=status.status)
 
+    @authentication_decorator
     def handle_get_nodes(self, handle, connection, match, data, hdr):
         """ Get active nodes
         """
         self.send_response(handle, connection, json.dumps(self.node.network.list_links()))
 
+    @authentication_decorator
     def handle_get_node(self, handle, connection, match, data, hdr):
         """ Get node information from id
         """
@@ -1054,12 +1271,13 @@ class CalvinControl(object):
             _log.error("Failed to update node %s", e)
             self.send_response(handle, connection, None, status=calvinresponse.INTERNAL_ERROR)
 
+    @authentication_decorator
     def handle_post_node_attribute_indexed_public(self, handle, connection, match, data, hdr):
         """ Update node information
         """
         try:
             if match.group(1) == self.node.id:
-                if self.node.domain is None:
+                if self.node.runtime_credentials is None or self.node.runtime_credentials.domain is None:
                     self.node.storage.remove_node_index(self.node)
                     self.node.attributes.set_indexed_public(data)
                     self.node_name = self.node.attributes.get_node_name_as_str()
@@ -1074,18 +1292,21 @@ class CalvinControl(object):
             _log.error("Failed to update node %s", e)
             self.send_response(handle, connection, None, status=calvinresponse.INTERNAL_ERROR)
 
+    @authentication_decorator
     def handle_get_applications(self, handle, connection, match, data, hdr):
         """ Get applications
         """
         self.send_response(
             handle, connection, json.dumps(self.node.app_manager.list_applications()))
 
+    @authentication_decorator
     def handle_get_application(self, handle, connection, match, data, hdr):
         """ Get application from id
         """
         self.node.storage.get_application(match.group(1), CalvinCB(
             func=self.storage_cb, handle=handle, connection=connection))
 
+    @authentication_decorator
     def handle_del_application(self, handle, connection, match, data, hdr):
         """ Delete application from id
         """
@@ -1097,8 +1318,13 @@ class CalvinControl(object):
             self.send_response(handle, connection, None, status=calvinresponse.INTERNAL_ERROR)
 
     def handle_del_application_cb(self, handle, connection, status=None):
-        self.send_response(handle, connection, None, status=status.status)
+        if not status and status.data:
+            data = json.dumps(status.data)
+        else:
+            data = None
+        self.send_response(handle, connection, data, status=status.status)
 
+    @authentication_decorator
     def handle_new_actor(self, handle, connection, match, data, hdr):
         """ Create actor
         """
@@ -1112,6 +1338,7 @@ class CalvinControl(object):
         self.send_response(
             handle, connection, None if actor_id is None else json.dumps({'actor_id': actor_id}), status=status)
 
+    @authentication_decorator
     def handle_get_actors(self, handle, connection, match, data, hdr):
         """ Get actor list
         """
@@ -1119,12 +1346,14 @@ class CalvinControl(object):
         self.send_response(
             handle, connection, json.dumps(actors))
 
+    @authentication_decorator
     def handle_get_actor(self, handle, connection, match, data, hdr):
         """ Get actor from id
         """
         self.node.storage.get_actor(match.group(1), CalvinCB(
             func=self.storage_cb, handle=handle, connection=connection))
 
+    @authentication_decorator
     def handle_del_actor(self, handle, connection, match, data, hdr):
         """ Delete actor from id
         """
@@ -1136,11 +1365,13 @@ class CalvinControl(object):
             status = calvinresponse.NOT_FOUND
         self.send_response(handle, connection, None, status=status)
 
-    def handle_get_actor_report(self, handle, connection, match, data, hdr):
+    @authentication_decorator
+    def handle_actor_report(self, handle, connection, match, data, hdr):
         """ Get report from actor
         """
         try:
-            report = self.node.am.report(match.group(1))
+            # Now we allow passing in arguments (must be dictionary or None)
+            report = self.node.am.report(match.group(1), data)
             status = calvinresponse.OK
         except:
             _log.exception("Actor report failed")
@@ -1149,6 +1380,7 @@ class CalvinControl(object):
         self.send_response(
             handle, connection, None if report is None else json.dumps(report), status=status)
 
+    @authentication_decorator
     def handle_actor_migrate(self, handle, connection, match, data, hdr):
         """ Migrate actor
         """
@@ -1182,6 +1414,7 @@ class CalvinControl(object):
         self.send_response(handle, connection,
                            None, status=status.status)
 
+    @authentication_decorator
     def handle_actor_disable(self, handle, connection, match, data, hdr):
         try:
             self.node.am.disable(match.group(1))
@@ -1190,12 +1423,51 @@ class CalvinControl(object):
             status = calvinresponse.NOT_FOUND
         self.send_response(handle, connection, None, status)
 
+    @authentication_decorator
+    def handle_actor_replicate(self, handle, connection, match, data, hdr):
+        data = {} if data is None else data
+        # TODO When feature ready, only requirement based scaling should be accessable (if not also that removed)
+        # TODO Make replication requirements a part of deployment requirements
+        # Dereplication
+        if data.get('dereplicate', False):
+            exhaust = data.get('exhaust', False)
+            try:
+                self.node.rm.dereplicate(
+                    match.group(1), CalvinCB(self.handle_actor_replicate_cb, handle, connection), exhaust)
+            except:
+                _log.exception("Dereplication failed")
+                self.send_response(handle, connection, None, calvinresponse.INTERNAL_ERROR)
+            return
+        try:
+            # Supervise with potential autoscaling in requirements
+            requirements = data.get('requirements', {})
+            status_supervise = self.node.rm.supervise_actor(match.group(1), requirements)
+            if status_supervise.status != calvinresponse.OK:
+                _log.debug("Replication supervised failed %s" % (match.group(1),))
+                self.send_response(handle, connection, None, status_supervise.status)
+                return
+            if not requirements:
+                # Direct replication only
+                node_id = data.get('peer_node_id', self.node.id)
+                self.node.rm.replicate(
+                    match.group(1), node_id, CalvinCB(self.handle_actor_replicate_cb, handle, connection))
+                return
+            self.send_response(handle, connection, json.dumps(status_supervise.data), calvinresponse.OK)
+        except:
+            _log.exception("Failed test replication")
+            self.send_response(handle, connection, None, calvinresponse.NOT_FOUND)
+
+    def handle_actor_replicate_cb(self, handle, connection, status):
+        self.send_response(handle, connection, json.dumps(status.data), status=status.status)
+
+#    @authentication_decorator
     def handle_get_port(self, handle, connection, match, data, hdr):
         """ Get port from id
         """
         self.node.storage.get_port(match.group(2), CalvinCB(
             func=self.storage_cb, handle=handle, connection=connection))
 
+    @authentication_decorator
     def handle_get_port_state(self, handle, connection, match, data, hdr):
         """ Get port from id
         """
@@ -1207,6 +1479,7 @@ class CalvinControl(object):
             status = calvinresponse.NOT_FOUND
         self.send_response(handle, connection, json.dumps(state), status)
 
+    @authentication_decorator
     def handle_connect(self, handle, connection, match, data, hdr):
         """ Connect port
         """
@@ -1229,7 +1502,9 @@ class CalvinControl(object):
         peer_port_id = kwargs.get('peer_port_id', None)
         self.send_response(handle, connection, json.dumps({'peer_port_id': peer_port_id}) if status else None,
                            status=status.status)
+        _log.debug("Handle connect finnished")
 
+    @authentication_decorator
     def handle_set_port_property(self, handle, connection, match, data, hdr):
         try:
             if data.get("port_properties") is None:
@@ -1252,21 +1527,28 @@ class CalvinControl(object):
             status = calvinresponse.CalvinResponse(calvinresponse.NOT_FOUND)
         self.send_response(handle, connection, None, status=status.status)
 
+    @authentication_decorator
     def handle_deploy(self, handle, connection, match, data, hdr):
         try:
             _log.analyze(self.node.id, "+", data)
             if 'app_info' not in data:
                 kwargs = {}
+                credentials = ""
                 # Supply security verification data when available
+                content = None
                 if "sec_credentials" in data:
-                    kwargs['credentials'] = data['sec_credentials']
-                    if "sec_sign" in data:
-                        kwargs['content'] = {
+                    credentials = data['sec_credentials']
+                    content = {}
+                    if not "sec_sign" in data:
+                        data['sec_sign'] = {}
+                    content = {
                             'file': data["script"],
                             'sign': {h: s.decode('hex_codec') for h, s in data['sec_sign'].iteritems()}}
                 compiler.compile_script_check_security(
                     data["script"],
                     filename=data["name"],
+                    security=self.security,
+                    content=content,
                     node=self.node,
                     verify=(data["check"] if "check" in data else True),
                     cb=CalvinCB(self.handle_deploy_cont, handle=handle, connection=connection, data=data),
@@ -1285,32 +1567,46 @@ class CalvinControl(object):
                 issuetracker = IssueTracker()
                 self.handle_deploy_cont(app_info, issuetracker, handle, connection, data)
         except Exception as e:
-            _log.exception("Deployer failed")
+            _log.exception("Deployer failed, e={}".format(e))
             self.send_response(handle, connection, json.dumps({'exception': str(e)}),
                                status=calvinresponse.INTERNAL_ERROR)
 
     def handle_deploy_cont(self, app_info, issuetracker, handle, connection, data, security=None):
         try:
             if issuetracker.error_count:
-                four_oh_ones = [e for e in issuetracker.errors() if 'status' in e and e['status' == 401]]
-                if four_oh_ones:
-                    _log.error("Security verification of script failed")
-                    status = calvinresponse.UNAUTHORIZED
-                    body = None
-                else:
-                    _log.exception("Compilation failed")
-                    body = json.dumps({'errors': issuetracker.errors(), 'warnings': issuetracker.warnings()})
-                    status=calvinresponse.BAD_REQUEST
-                self.send_response(handle, connection, body, status=status)
-                return
+                four_oh_ones = [e for e in issuetracker.errors(sort_key='reason')]
+                errors = issuetracker.errors(sort_key='reason')
+                for e in errors:
+                    if 'status' in e and e['status'] == 401:
+                        _log.error("Security verification of script failed")
+                        status = calvinresponse.UNAUTHORIZED
+                        body = None
+                    else:
+                        _log.exception("Compilation failed")
+                        body = json.dumps({'errors': issuetracker.errors(), 'warnings': issuetracker.warnings()})
+                        status=calvinresponse.BAD_REQUEST
+                    self.send_response(handle, connection, body, status=status)
+                    return
             _log.analyze(
                 self.node.id,
                 "+ COMPILED",
                 {'app_info': app_info, 'errors': issuetracker.errors(), 'warnings': issuetracker.warnings()}
             )
+            # TODO When deployscript codegen is less experimental do it as part of the cscompiler
+            # Now just run it here seperate if script is supplied and no seperate deploy_info
+            deploy_info = data.get("deploy_info", None)
+            if "script" in data and deploy_info is None:
+                deploy_info, ds_issuestracker = calvin_dscodegen(data["script"], data["name"])
+                if ds_issuestracker.error_count:
+                    _log.warning("Deployscript contained errors:")
+                    _log.warning(ds_issuestracker.formatted_issues())
+                    deploy_info = None
+                elif not deploy_info['requirements']:
+                    deploy_info = None
+
             d = Deployer(
                     deployable=app_info,
-                    deploy_info=data["deploy_info"] if "deploy_info" in data else None,
+                    deploy_info=deploy_info,
                     node=self.node,
                     name=data["name"] if "name" in data else None,
                     security=security,
@@ -1332,6 +1628,7 @@ class CalvinControl(object):
     def handle_deploy_cb(self, handle, connection, status, deployer, **kwargs):
         _log.analyze(self.node.id, "+ DEPLOYED", {'status': status.status})
         if status:
+            print "DEPLOY STATUS", str(status)
             self.send_response(handle, connection,
                                json.dumps({'application_id': deployer.app_id,
                                            'actor_map': deployer.actor_map,
@@ -1342,6 +1639,7 @@ class CalvinControl(object):
         else:
             self.send_response(handle, connection, None, status=status.status)
 
+    @authentication_decorator
     def handle_post_application_migrate(self, handle, connection, match, data, hdr):
         app_id = match.group(1)
         try:
@@ -1357,20 +1655,42 @@ class CalvinControl(object):
         _log.analyze(self.node.id, "+ MIGRATED", {'status': status.status})
         self.send_response(handle, connection, None, status=status.status)
 
+    @authentication_decorator
     def handle_quit(self, handle, connection, match, data, hdr):
-        async.DelayedCall(.2, self.node.stop)
-        self.send_response(handle, connection, None, status=calvinresponse.ACCEPTED)
+        if match.group(1) is None or match.group(1) == "now":
+            async.DelayedCall(.2, self.node.stop)
+            self.send_response(handle, connection, None, status=calvinresponse.ACCEPTED)
+        elif match.group(1) == "migrate":
+            async.DelayedCall(.2, self.node.stop_with_migration)
+            self.send_response(handle, connection, None, status=calvinresponse.ACCEPTED)
 
+    @authentication_decorator
     def handle_disconnect(self, handle, connection, match, data, hdr):
-        self.node.disconnect(
-            data['actor_id'], data['port_name'], data['port_dir'], data['port_id'],
-            cb=CalvinCB(self.handle_disconnect_cb, handle, connection))
+        actor_id = data.get('actor_id', None)
+        port_name = data.get('port_name', None)
+        port_dir = data.get('port_dir', None)
+        port_id = data.get('port_id', None)
+        # Convert type of disconnect as string to enum value
+        # Allowed values TEMPORARY, TERMINATE, EXHAUST
+        terminate = data.get('terminate', "TEMPORARY")
+        try:
+            terminate = DISCONNECT.__getattribute__(DISCONNECT, terminate)
+        except:
+            terminate = DISCONNECT.TEMPORARY
+
+        _log.debug("disconnect(actor_id=%s, port_name=%s, port_dir=%s, port_id=%s)" %
+                   (actor_id if actor_id else "", port_name if port_name else "",
+                    port_dir if port_dir else "", port_id if port_id else ""))
+        self.node.pm.disconnect(actor_id=actor_id, port_name=port_name,
+                           port_dir=port_dir, port_id=port_id, terminate=terminate,
+                           callback=CalvinCB(self.handle_disconnect_cb, handle, connection))
 
     def handle_disconnect_cb(self, handle, connection, **kwargs):
         status = kwargs.get('status', None)
         _log.analyze(self.node.id, "+ DISCONNECTED", {'status': status.status}, tb=True)
         self.send_response(handle, connection, None, status=status.status)
 
+    @authentication_decorator
     def handle_post_meter(self, handle, connection, match, data, hdr):
         try:
             user_id = self.metering.register(data['user_id'] if data and 'user_id' in data else None)
@@ -1382,8 +1702,9 @@ class CalvinControl(object):
         self.send_response(handle, connection, json.dumps({ 'user_id': user_id,
                                                             'timeout': timeout,
                                                             'epoch_year': time.gmtime(0).tm_year})
-                                                if status == calvinresponse.OK else None, status=status)
+                            if status == calvinresponse.OK else None, status=status)
 
+    @authentication_decorator
     def handle_delete_meter(self, handle, connection, match, data, hdr):
         try:
             self.metering.unregister(match.group(1))
@@ -1393,6 +1714,7 @@ class CalvinControl(object):
             status = calvinresponse.NOT_FOUND
         self.send_response(handle, connection, None, status=status)
 
+    @authentication_decorator
     def handle_get_timed_meter(self, handle, connection, match, data, hdr):
         try:
             data = self.metering.get_timed_meter(match.group(1))
@@ -1403,6 +1725,7 @@ class CalvinControl(object):
         self.send_response(handle, connection,
             json.dumps(data) if status == calvinresponse.OK else None, status=status)
 
+    @authentication_decorator
     def handle_get_aggregated_meter(self, handle, connection, match, data, hdr):
         try:
             data = self.metering.get_aggregated_meter(match.group(1))
@@ -1413,6 +1736,7 @@ class CalvinControl(object):
         self.send_response(handle, connection,
             json.dumps(data) if status == calvinresponse.OK else None, status=status)
 
+    @authentication_decorator
     def handle_get_metainfo_meter(self, handle, connection, match, data, hdr):
         try:
             data = self.metering.get_actors_info(match.group(1))
@@ -1423,18 +1747,22 @@ class CalvinControl(object):
         self.send_response(handle, connection,
             json.dumps(data) if status == calvinresponse.OK else None, status=status)
 
+    @authentication_decorator
     def handle_post_index(self, handle, connection, match, data, hdr):
         """ Add to index
         """
         self.node.storage.add_index(
             match.group(1), data['value'], cb=CalvinCB(self.index_cb, handle, connection))
 
+    @authentication_decorator
     def handle_delete_index(self, handle, connection, match, data, hdr):
         """ Remove from index
         """
         self.node.storage.remove_index(
             match.group(1), data['value'], cb=CalvinCB(self.index_cb, handle, connection))
 
+    #Can't be access controlled, as it is needed to find authorization server
+#    @authentication_decorator
     def handle_get_index(self, handle, connection, match, data, hdr):
         """ Get from index
         """
@@ -1459,16 +1787,39 @@ class CalvinControl(object):
         self.send_response(handle, connection, None if value is None else json.dumps({'result': value}),
                            status=calvinresponse.NOT_FOUND if value is None else calvinresponse.OK)
 
+    @authentication_decorator
     def handle_post_storage(self, handle, connection, match, data, hdr):
         """ Store in storage
         """
         self.node.storage.set("", match.group(1), data['value'], cb=CalvinCB(self.index_cb, handle, connection))
 
+    @authentication_decorator
     def handle_get_storage(self, handle, connection, match, data, hdr):
         """ Get from storage
         """
         self.node.storage.get("", match.group(1), cb=CalvinCB(self.get_index_cb, handle, connection))
 
+    @authentication_decorator
+    def handle_dump_storage(self, handle, connection, match, data, hdr):
+        """ Get from storage
+        """
+        name = self.node.storage.dump()
+        self.send_response(handle, connection, json.dumps(name), status=calvinresponse.OK)
+
+    # No authentication decorator, this is called by the runtimes when deployed
+    # without a certificate
+    def handle_post_certificate_signing_request(self, handle, connection, match, data, hdr):
+        """Post a CSR, if ok, CA creates and returns X509 certificate """
+        try:
+            cert = self.node.certificate_authority.sign_csr_request(data)
+            status = calvinresponse.OK
+        except:
+            _log.exception("handle_post_certificate_signing_request")
+            status = calvinresponse.INTERNAL_ERROR
+        self.send_response(handle, connection, json.dumps({"certificate": cert}) if status == calvinresponse.OK else None,
+                           status=status)
+
+    @authentication_decorator
     def handle_get_authentication_users_db(self, handle, connection, match, data, hdr):
         """Get all authorization policies on this runtime"""
         try:
@@ -1480,29 +1831,37 @@ class CalvinControl(object):
         self.send_response(handle, connection, json.dumps({"users_db": users_db}) if status == calvinresponse.OK else None,
                            status=status)
 
+    @authentication_decorator
     def handle_edit_authentication_users_db(self, handle, connection, match, data, hdr):
         """Edit users database"""
         # TODO: need some kind of authentication for policy management
-        try:
-#            self.node.authentication.arp.update_users_db(data, match.group(1))
-            self.node.authentication.arp.update_users_db(data)
-            status = calvinresponse.OK
-        except IOError:
-            _log.exception("handle_edit_authentication_users_db")
+        if 'users_db'in data:
+            try:
+    #            self.node.authentication.arp.update_users_db(data, match.group(1))
+                self.node.authentication.arp.update_users_db(data['users_db'])
+                status = calvinresponse.OK
+            except IOError as err:
+                _log.exception("handle_edit_authentication_users_db, err={}".format(err))
+                status = calvinresponse.NOT_FOUND
+            except Exception as err:
+                _log.exception("handle_edit_authentication_users_db, err={}".format(err))
+                status = calvinresponse.INTERNAL_ERROR
+        else:
+            _log.exception("handle_edit_authentication_users_db: no users_db in data\n\tdata={}".format(data))
             status = calvinresponse.NOT_FOUND
-        except:
-            _log.exception("handle_edit_authentication_users_db")
-            status = calvinresponse.INTERNAL_ERROR
         self.send_response(handle, connection, None, status=status)
 
+    @authentication_decorator
     def handle_get_authentication_groups_db(self, handle, connection, match, data, hdr):
         """Get all authorization policies on this runtime"""
         #TODO:to be implemented
 
+    @authentication_decorator
     def handle_edit_authentication_groups_db(self, handle, connection, match, data, hdr):
         """Edit authorization policy identified by id"""
         #TODO:to be implemented
 
+    @authentication_decorator
     def handle_new_authorization_policy(self, handle, connection, match, data, hdr):
         """Create authorization policy"""
         # TODO: need some kind of authentication for policy management
@@ -1516,6 +1875,7 @@ class CalvinControl(object):
         self.send_response(handle, connection, None if policy_id is None else json.dumps({'policy_id': policy_id}),
                            status=status)
 
+    @authentication_decorator
     def handle_get_authorization_policies(self, handle, connection, match, data, hdr):
         """Get all authorization policies on this runtime"""
         try:
@@ -1527,6 +1887,7 @@ class CalvinControl(object):
         self.send_response(handle, connection, json.dumps({"policies": policies}) if status == calvinresponse.OK else None,
                            status=status)
 
+    @authentication_decorator
     def handle_get_authorization_policy(self, handle, connection, match, data, hdr):
         """Get authorization policy identified by id"""
         try:
@@ -1541,6 +1902,7 @@ class CalvinControl(object):
         self.send_response(handle, connection, json.dumps({"policy": data}) if status == calvinresponse.OK else None,
                            status=status)
 
+    @authentication_decorator
     def handle_edit_authorization_policy(self, handle, connection, match, data, hdr):
         """Edit authorization policy identified by id"""
         # TODO: need some kind of authentication for policy management
@@ -1555,6 +1917,7 @@ class CalvinControl(object):
             status = calvinresponse.INTERNAL_ERROR
         self.send_response(handle, connection, None, status=status)
 
+    @authentication_decorator
     def handle_del_authorization_policy(self, handle, connection, match, data, hdr):
         """ Delete authorization policy identified by id"""
         # TODO: need some kind of authentication for policy management
@@ -1670,6 +2033,57 @@ class CalvinControl(object):
         for user_id in disconnected:
             del self.loggers[user_id]
 
+    def log_actor_replicate(self, actor_id, replica_actor_id, replication_id, dest_node_id):
+        """ Trace actor replication
+        """
+        disconnected = []
+        for user_id, logger in self.loggers.iteritems():
+            if not logger.events or self.LOG_ACTOR_REPLICATE in logger.events:
+                if not logger.actors or actor_id in logger.actors:
+                    data = {}
+                    data['timestamp'] = time.time()
+                    data['node_id'] = self.node.id
+                    data['type'] = 'actor_replicate'
+                    data['actor_id'] = actor_id
+                    data['dest_node_id'] = dest_node_id
+                    data['replication_id'] = replication_id
+                    data['replica_actor_id'] = replica_actor_id
+                    if logger.connection is not None:
+                        if not logger.connection.connection_lost:
+                            logger.connection.send("data: %s\n\n" % json.dumps(data))
+                        else:
+                            disconnected.append(user_id)
+                    elif self.tunnel_client is not None and logger.handle is not None:
+                        msg = {"cmd": "logevent", "msgid": logger.handle, "header": None, "data": "data: %s\n\n" % json.dumps(data)}
+                        self.tunnel_client.send(msg)
+        for user_id in disconnected:
+            del self.loggers[user_id]
+
+    def log_actor_dereplicate(self, actor_id, replica_actor_id, replication_id):
+        """ Trace actor dereplication
+        """
+        disconnected = []
+        for user_id, logger in self.loggers.iteritems():
+            if not logger.events or self.LOG_ACTOR_DEREPLICATE in logger.events:
+                if not logger.actors or actor_id in logger.actors:
+                    data = {}
+                    data['timestamp'] = time.time()
+                    data['node_id'] = self.node.id
+                    data['type'] = 'actor_dereplicate'
+                    data['actor_id'] = actor_id
+                    data['replication_id'] = replication_id
+                    data['replica_actor_id'] = replica_actor_id
+                    if logger.connection is not None:
+                        if not logger.connection.connection_lost:
+                            logger.connection.send("data: %s\n\n" % json.dumps(data))
+                        else:
+                            disconnected.append(user_id)
+                    elif self.tunnel_client is not None and logger.handle is not None:
+                        msg = {"cmd": "logevent", "msgid": logger.handle, "header": None, "data": "data: %s\n\n" % json.dumps(data)}
+                        self.tunnel_client.send(msg)
+        for user_id in disconnected:
+            del self.loggers[user_id]
+
     def log_application_new(self, application_id, application_name):
         """ Trace application new
         """
@@ -1761,6 +2175,29 @@ class CalvinControl(object):
         for user_id in disconnected:
             del self.loggers[user_id]
 
+    def log_log_message(self, message):
+        """ Log message that is displayed at listener
+        """
+        disconnected = []
+        for user_id, logger in self.loggers.iteritems():
+            if not logger.events or self.LOG_LOG_MESSAGE in logger.events:
+                data = {}
+                data['timestamp'] = time.time()
+                data['node_id'] = self.node.id
+                data['type'] = 'log_message'
+                data['msg'] = message
+                if logger.connection is not None:
+                    if not logger.connection.connection_lost:
+                        logger.connection.send("data: %s\n\n" % json.dumps(data))
+                    else:
+                        disconnected.append(user_id)
+                elif self.tunnel_client is not None and logger.handle is not None:
+                    msg = {"cmd": "logevent", "msgid": logger.handle, "header": None, "data": "data: %s\n\n" % json.dumps(data)}
+                    self.tunnel_client.send(msg)
+        for user_id in disconnected:
+            del self.loggers[user_id]
+
+    @authentication_decorator
     def handle_options(self, handle, connection, match, data, hdr):
         """ Handle HTTP OPTIONS requests
         """

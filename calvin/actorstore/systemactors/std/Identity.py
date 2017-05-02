@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition
+from calvin.actor.actor import Actor, manage, condition
 
 
 class Identity(Actor):
@@ -25,18 +25,23 @@ class Identity(Actor):
     Outputs:
       token : the same token
     """
-    @manage(['dump'])
+    @manage(['dump', 'last'])
     def init(self, dump=False):
         self.dump = dump
+        self.last = None
 
     def log(self, data):
-        print "%s<%s>: %s" % (self.__class__.__name__, self.id, data)
+        print "%s<%s,%s>: %s" % (self.__class__.__name__, self.name, self.id, data)
 
     @condition(['token'], ['token'])
     def donothing(self, input):
         if self.dump:
             self.log(input)
-        return ActionResult(production=(input, ))
+        self.last = input
+        return (input, )
+
+    def report(self):
+        return self.last
 
     action_priority = (donothing, )
 

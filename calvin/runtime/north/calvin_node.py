@@ -17,17 +17,20 @@
 from multiprocessing import Process
 # For trace
 import sys
+import os
 import trace
 import logging
 
 from calvin.calvinsys import Sys as CalvinSys
 
 from calvin.runtime.north import actormanager
+from calvin.runtime.north import replicationmanager
 from calvin.runtime.north import appmanager
 from calvin.runtime.north import scheduler
 from calvin.runtime.north import storage
 from calvin.runtime.north import calvincontrol
 from calvin.runtime.north import metering
+from calvin.runtime.north.certificate_authority import certificate_authority
 from calvin.runtime.north.authentication import authentication
 from calvin.runtime.north.authorization import authorization
 from calvin.runtime.north.calvin_network import CalvinNetwork
@@ -38,9 +41,10 @@ from calvin.runtime.south.plugins.async import async
 from calvin.utilities.attribute_resolver import AttributeResolver
 from calvin.utilities.calvin_callback import CalvinCB
 from calvin.utilities.security import security_modules_check
+from calvin.utilities.runtime_credentials import RuntimeCredentials
 from calvin.utilities import calvinuuid
 from calvin.utilities import certificate
-from calvin.utilities.calvinlogger import get_logger
+from calvin.utilities.calvinlogger import get_logger, set_file
 from calvin.utilities import calvinconfig
 
 _log = get_logger(__name__)
@@ -62,14 +66,27 @@ class Node(object):
        such as name of node
     """
 
-    def __init__(self, uri, control_uri, attributes=None):
+    def __init__(self, uris, control_uri, attributes=None):
         super(Node, self).__init__()
-        self.uri = uri
+        self.quitting = False
+
+        # Warn if its not a uri
+        if not isinstance(uris, list):
+            _log.error("Calvin uris must be a list %s" % uris)
+            raise TypeError("Calvin uris must be a list!")
+
+        # Uris
+        self.uris = uris
+        if attributes:
+            ext_uris = attributes.pop('external_uri', None)
+        if ext_uris is not None:
+            self.uris += ext_uris
+
+        # Control uri
         self.control_uri = control_uri
-        self.external_uri = attributes.pop('external_uri', self.uri) \
-            if attributes else self.uri
         self.external_control_uri = attributes.pop('external_control_uri', self.control_uri) \
             if attributes else self.control_uri
+
         try:
             self.attributes = AttributeResolver(attributes)
         except:
@@ -78,20 +95,21 @@ class Node(object):
         self.node_name = self.attributes.get_node_name_as_str()
         # Obtain node id, when using security also handle runtime certificate
         self.id = certificate.obtain_cert_node_info(self.node_name)['id']
+        self.certificate_authority = certificate_authority.CertificateAuthority(self)
         self.authentication = authentication.Authentication(self)
         self.authorization = authorization.Authorization(self)
+        security_dir = _conf.get("security", "security_dir")
         try:
-            self.domain = _conf.get("security", "security_domain_name")
-            # cert_name is the node's certificate filename (without file extension)
-            self.cert_name = certificate.get_own_cert_name(self.node_name)
-        except:
-            self.domain = None
-            self.cert_name = None
+            self.runtime_credentials = RuntimeCredentials(self.node_name, node=self, security_dir=security_dir)
+        except Exception as err:
+            _log.debug("No runtime credentials, err={}".format(err))
+            self.runtime_credentials = None
         self.metering = metering.set_metering(metering.Metering(self))
         self.monitor = Event_Monitor()
         self.am = actormanager.ActorManager(self)
+        self.rm = replicationmanager.ReplicationManager(self)
         self.control = calvincontrol.get_calvincontrol()
-        
+
         _scheduler = scheduler.DebugScheduler if _log.getEffectiveLevel() <= logging.DEBUG else scheduler.Scheduler
         self.sched = _scheduler(self, self.am, self.monitor)
         self.async_msg_ids = {}
@@ -136,14 +154,6 @@ class Node(object):
                         peer_port_properties=peer_port_properties,
                         peer_port_id=peer_port_id,
                         callback=CalvinCB(self.logging_callback, preamble="connect cb")  if cb is None else cb)
-
-    def disconnect(self, actor_id=None, port_name=None, port_dir=None, port_id=None, cb=None):
-        _log.debug("disconnect(actor_id=%s, port_name=%s, port_dir=%s, port_id=%s)" %
-                   (actor_id if actor_id else "", port_name if port_name else "",
-                    port_dir if port_dir else "", port_id if port_id else ""))
-        self.pm.disconnect(actor_id=actor_id, port_name=port_name,
-                           port_dir=port_dir, port_id=port_id,
-                           callback=CalvinCB(self.logging_callback, preamble="disconnect cb") if cb is None else cb)
 
     def peersetup(self, peers, cb=None):
         """ Sets up a RT to RT communication channel, only needed if the peer can't be found in storage.
@@ -207,7 +217,7 @@ class Node(object):
         """ Run once when main loop is started """
         interfaces = _conf.get(None, 'transports')
         self.network.register(interfaces, ['json'])
-        self.network.start_listeners(self.uri)
+        self.network.start_listeners(self.uris)
         # Start storage after network, proto etc since storage proxy expects them
         self.storage.start(cb=CalvinCB(self._storage_started_cb))
         self.storage.add_node(self)
@@ -222,6 +232,7 @@ class Node(object):
                 self.control.start(node=self, uri=self.control_uri, external_uri=self.external_control_uri)
 
     def stop(self, callback=None):
+        self.quitting = True
         def stopped(*args):
             _log.analyze(self.id, "+", {'args': args})
             _log.debug(args)
@@ -236,22 +247,123 @@ class Node(object):
 
         _log.analyze(self.id, "+", {})
         self.storage.delete_node(self, cb=deleted_node)
+        for link in self.network.list_direct_links():
+            self.network.links[link].close()
+
+    def stop_with_migration(self, callback=None):
+        # Set timeout if we are still failing after 50 seconds
+        timeout_stop = async.DelayedCall(50, self.stop)
+        self.quitting = True
+        actors = []
+        already_migrating = []
+        if not self.am.actors:
+            return self.stop(callback)
+        for actor in self.am.actors.values():
+            if actor._migrating_to is None:
+                actors.append(actor)
+            else:
+                already_migrating.append(actor.id)
+
+        def poll_migrated():
+            # When already migrating, we can only poll, since we don't get the callback
+            if self.am.actors:
+                # Check again in a sec
+                async.DelayedCall(1, self.poll_migrated)
+                return
+            timeout_stop.cancel()
+            self.stop(callback)
+
+        def migrated(actor_id, **kwargs):
+            actor = self.am.actors.get(actor_id, None)
+            status = kwargs['status']
+            if actor is not None:
+                # Failed to migrate according to requirements, try the current known peers
+                peer_ids = self.network.list_direct_links()
+                if peer_ids:
+                    # This will remove the actor from the list of actors
+                    self.am.robust_migrate(actor_id, peer_ids, callback=CalvinCB(migrated, actor_id=actor_id))
+                    return
+                else:
+                    # Ok, we have failed migrate actor according to requirements and to any known peer
+                    # FIXME find unknown peers and try migrate to them, now just destroy actor, so storage is cleaned
+                    _log.error("Failed to evict actor %s before quitting" % actor_id)
+                    self.node.am.destroy(actor_id)
+            if self.am.actors:
+                return
+            timeout_stop.cancel()
+            self.stop(callback)
+
+        if already_migrating:
+            async.DelayedCall(1, self.poll_migrated)
+            if not actors:
+                return
+        elif not actors:
+            # No actors
+            return self.stop(callback)
+
+        # Migrate the actors according to their requirements
+        # (even actors without explicit requirements will migrate based on e.g. requires and port property needs)
+        for actor in actors:
+            if actor._replication_data.terminate_with_node(actor.id):
+                _log.info("TERMINATE REPLICA")
+                self.rm.terminate(actor.id, callback=CalvinCB(migrated, actor_id=actor.id))
+            else:
+                _log.info("TERMINATE MIGRATE ACTOR")
+                self.am.update_requirements(actor.id, [], extend=True, move=True,
+                            authorization_check=False, callback=CalvinCB(migrated, actor_id=actor.id))
 
     def _storage_started_cb(self, *args, **kwargs):
         self.authorization.register_node()
 
+def setup_logging(filename):
+
+    #from twisted.python import log
+    #from twisted.internet import defer
+    #import sys
+    #defer.setDebugging(True)
+    #log.startLogging(sys.stdout)
+
+    levels = os.getenv('CALVIN_TESTS_LOG_LEVELS', "").split(':')
+
+    set_file(filename)
+
+    if not levels:
+        get_logger().setLevel(logging.INFO)
+        return
+
+    for level in levels:
+        module = None
+        if ":" in level:
+            module, level = level.split(":")
+        if level == "CRITICAL":
+            get_logger(module).setLevel(logging.CRITICAL)
+        elif level == "ERROR":
+            get_logger(module).setLevel(logging.ERROR)
+        elif level == "WARNING":
+            get_logger(module).setLevel(logging.WARNING)
+        elif level == "INFO":
+            get_logger(module).setLevel(logging.INFO)
+        elif level == "DEBUG":
+            get_logger(module).setLevel(logging.DEBUG)
+        elif level == "ANALYZE":
+            get_logger(module).setLevel(5)
+
 
 def create_node(uri, control_uri, attributes=None):
+    logfile = os.getenv('CALVIN_TEST_LOG_FILE', None)
+    setup_logging(logfile)
     n = Node(uri, control_uri, attributes)
     n.run()
-    _log.info('Quitting node "%s"' % n.uri)
+    _log.info('Quitting node "%s"' % n.uris)
 
 
-def create_tracing_node(uri, control_uri, attributes=None):
+def create_tracing_node(uri, control_uri, attributes=None, logfile=None):
     """
     Same as create_node, but will trace every line of execution.
     Creates trace dump in output file '<host>_<port>.trace'
     """
+    logfile = os.getenv('CALVIN_TEST_LOG_FILE', None)
+    setup_logging(logfile)
     n = Node(uri, control_uri, attributes)
     _, host = uri.split('://')
     with open("%s.trace" % (host, ), "w") as f:
@@ -265,10 +377,12 @@ def create_tracing_node(uri, control_uri, attributes=None):
             'fnmatch', 'urlparse', 're', 'stat', 'six'
         ]
         with f as sys.stdout:
-            tracer = trace.Trace(trace=1, count=0, ignoremods=ignore)
+            paths = sys.path
+            #tracer = trace.Trace(trace=1, count=0, ignoremods=ignore)
+            tracer = trace.Trace(trace=1, count=0, ignoredir=paths)
             tracer.runfunc(n.run)
         sys.stdout = tmp
-    _log.info('Quitting node "%s"' % n.uri)
+    _log.info('Quitting node "%s"' % n.uris)
 
 
 def start_node(uri, control_uri, trace_exec=False, attributes=None):

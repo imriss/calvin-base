@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, condition
+from calvin.actor.actor import Actor, condition
 
 
 class Wrapper(object):
@@ -65,7 +65,7 @@ class ExplicitStateExample(Actor):
 
     @condition(['token'], ['token'])
     def wrap_action(self, input):
-        return ActionResult(production=(self.wrapper.wrap(input), ))
+        return (self.wrapper.wrap(input), )
 
     action_priority = (wrap_action,)
 

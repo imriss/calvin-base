@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 
 from calvin.utilities.calvinlogger import get_logger
 
@@ -27,11 +27,10 @@ class UDPListener(Actor):
 
     Control port takes control commands of the form (uri only applicable for connect.)
 
-    {
-        "command" : "connect"/"disconnect",
-        "uri": "udp://<ipv4 address>:<port>"
-    }
-
+        {
+            "command" : "listen"/"stop",
+            "uri": "udp://<ipv4 address>:<port>"
+        }
 
 
     Input:
@@ -59,11 +58,11 @@ class UDPListener(Actor):
         self.use('calvinsys.network.serverhandler', shorthand='server')
         self.use('calvinsys.native.python-re', shorthand='regexp')
 
+    @stateguard(lambda self: self.listener and self.listener.have_data())
     @condition(action_output=['data_out'])
-    @guard(lambda self: self.listener and self.listener.have_data())
     def receive(self):
         data = self.listener.data_get()
-        return ActionResult(production=(data,))
+        return (data,)
 
     # URI parsing - 0: protocol, 1: host, 2: port
     URI_REGEXP = r'([^:]+)://([^/:]*):([0-9]+)'
@@ -85,19 +84,21 @@ class UDPListener(Actor):
         return status
 
     @condition(action_input=['control_in'])
-    @guard(lambda self, control: control.get('command', '') == 'listen' and not self.listener)
-    def new_port(self, control):
+    def control(self, control):
+        if control.get('command', '') == 'listen' and not self.listener:
+            self._new_port(control)
+        elif control.get('command', '') == 'stop' and self.listener:
+            self._close_port()
+
+
+    def _new_port(self, control):
         if self.parse_uri(control.get('uri', '')):
             self.listen()
-        return ActionResult()
 
-    @condition(action_input=['control_in'])
-    @guard(lambda self, control: control.get('command', '') == 'stop' and self.listener)
-    def close_port(self, control):
+    def _close_port(self):
         self.listener.stop()
         del self.listener
         self.listener = None
-        return ActionResult(production=())
 
-    action_priority = (new_port, close_port, receive)
+    action_priority = (control, receive)
     requires = ['calvinsys.network.serverhandler', 'calvinsys.native.python-re']

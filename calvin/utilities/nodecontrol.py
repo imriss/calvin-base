@@ -26,21 +26,23 @@ def node_control(control_uri, barrier=True):
         def __init__(self, control_uri, barrier):
             super(NodeControl, self).__init__()
             self._id = None
-            self._uri = None
+            self._uris = None
             self.control_uri = control_uri
             self.request_handler = RequestHandler()
+            delay = 0.1
             # When barrier ordered make sure we can contact the runtime
             if barrier:
-                failed = True
+                success = False
                 # Try 20 times waiting for control API to be up and running
                 for i in range(20):
                     try:
                         self._id = self.request_handler.get_node_id(self)
-                        failed = False
+                        success = True
                         break
-                    except:
-                        time.sleep(0.1)
-                assert not failed
+                    except Exception:
+                        time.sleep(delay)
+                        delay = 2*delay if delay < 1.0 else 1.0
+                assert success
 
         @property
         def id(self):
@@ -49,23 +51,23 @@ def node_control(control_uri, barrier=True):
             return self._id
 
         @property
-        def uri(self):
-            if self._uri is None:
-                self._uri = self.request_handler.get_node(self, self.id)["uri"]
-            return self._uri
+        def uris(self):
+            if self._uris is None:
+                self._uris = self.request_handler.get_node(self, self.id)["uris"]
+            return self._uris
 
     return NodeControl(control_uri, barrier=barrier)
 
 
-def dispatch_node(uri, control_uri, trace=False, attributes=None, barrier=True):
+def dispatch_node(uris, control_uri, trace=False, attributes=None, barrier=True):
     """ Dispatch calvin runtime in new process.
-        uri: list of uris for rt 2 rt comm
+        uris: list of uris for rt2rt comm
         control_uri: uri to control the rt
         trace: True/False
         attributes: dictionary according to documentation in AttributeResolver
         barrier: when True wait until managed to obtain the id of the runtime
     """
-    p = calvin_node.start_node(uri, control_uri, trace, attributes)
+    p = calvin_node.start_node(uris, control_uri, trace, attributes)
     return node_control(control_uri, barrier=barrier), p
 
 

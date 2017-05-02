@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, manage, condition, ActionResult
+from calvin.actor.actor import Actor, manage, condition
 from calvin.runtime.north.calvin_token import EOSToken
 
 
@@ -31,12 +31,12 @@ class PrefixString(Actor):
     def init(self, prefix='-'):
         self.prefix = str(prefix)
 
-    def exception_handler(self, action, args, exceptions):
-        return ActionResult(production=(EOSToken(), ))
+    def exception_handler(self, action, args):
+        return (EOSToken(), )
 
     @condition(['in'], ['out'])
     def prefix(self, token):
-        return ActionResult(production=(self.prefix + str(token), ))
+        return (self.prefix + str(token), )
 
     action_priority = (prefix, )
 

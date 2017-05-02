@@ -14,14 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 
 
 class Distance(Actor):
 
     """
-        Measure distance. Takes the frequency of measurements, in Hz, as input.
-        
+    Measure distance. Takes the frequency of measurements, in Hz, as input.
+
     Outputs:
         meters : Measured distance, in meters
     """
@@ -34,18 +34,18 @@ class Distance(Actor):
     def setup(self):
         self.use("calvinsys.sensors.distance", shorthand="distance")
         self['distance'].start(self.frequency)
-        
+
     def will_migrate(self):
         self['distance'].stop()
-        
+
     def did_migrate(self):
         self.setup()
-    
+
+    @stateguard(lambda self: self['distance'].has_data())
     @condition([], ['meters'])
-    @guard(lambda self: self['distance'].has_data())
     def measure(self):
         distance = self['distance'].read()
-        return ActionResult(production=(distance,))
+        return (distance,)
 
     action_priority = (measure,)
     requires =  ['calvinsys.sensors.distance']

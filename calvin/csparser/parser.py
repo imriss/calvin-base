@@ -30,7 +30,7 @@ class CalvinParser(object):
         if lexer:
             self.lexer = lexer
         else:
-            self.lexer = lex.lex(module=calvin_rules, debug=False, optimize=True)
+            self.lexer = lex.lex(module=calvin_rules, debug=False, optimize=False)
         # Since the parse may be called from other scripts, we want to have control
         # over where parse tables (and parser.out log) will be put if the tables
         # have to be recreated
@@ -43,9 +43,13 @@ class CalvinParser(object):
     def p_script(self, p):
         """script : opt_constdefs opt_compdefs opt_program"""
         s = ast.Node()
-        s.add_children(p[1] + p[2] + p[3])
-        p[0] = s
-
+        s.add_children(p[1] + p[2] + p[3][0])
+        root = ast.Node()
+        root.add_child(s.clone())
+        d = ast.Node()
+        d.add_children(p[1] + p[3][1])
+        root.add_child(d)
+        p[0] = root
 
     def p_opt_constdefs(self, p):
         """opt_constdefs :
@@ -88,7 +92,7 @@ class CalvinParser(object):
 
 
     def p_compdef(self, p):
-        """compdef : COMPONENT qualified_name LPAREN identifiers RPAREN identifiers RARROW identifiers LBRACE docstring program RBRACE"""
+        """compdef : COMPONENT qualified_name LPAREN identifiers RPAREN identifiers RARROW identifiers LBRACE docstring comp_statements RBRACE"""
         p[0] = ast.Component(name=p[2], arg_names=p[4], inports=p[6], outports=p[8], docstring=p[10], program=p[11], debug_info=self.debug_info(p, 1))
 
 
@@ -100,34 +104,159 @@ class CalvinParser(object):
         else:
             p[0] = p[1]
 
-
-    def p_opt_program(self, p):
-        """opt_program :
-                       | program"""
-        if len(p) == 1:
-            p[0] = []
-        else:
-            p[0] = [ast.Block(program=p[1], namespace='__scriptname__', debug_info=self.debug_info(p, 1))]
-
-
-    def p_program(self, p):
-        """program : program statement
-                   | statement """
+    def p_comp_statements(self, p):
+        """comp_statements : comp_statements comp_statement
+                           | comp_statement"""
         if len(p) == 2:
             p[0] = [p[1]]
         else:
             p[0] = p[1] + [p[2]]
 
+    def p_comp_statement(self, p):
+        """comp_statement : assignment
+                          | port_property
+                          | internal_port_property
+                          | link"""
+        p[0] = p[1]
+
+    def p_opt_program(self, p):
+        """opt_program :
+                       | program"""
+        if len(p) == 1:
+            p[0] = [[],[]]
+        else:
+            p[0] = [
+                [ast.Block(program=p[1][0], namespace='__scriptname__', debug_info=self.debug_info(p, 1))],
+                p[1][1]
+            ]
+
+    def p_program(self, p):
+        """program : program statement
+                   | statement """
+        if len(p) == 2:
+            if type(p[1]) in [ast.Group, ast.Rule, ast.RuleApply]:
+                p[0] = [[], [p[1]]]
+            else:
+                p[0] = [[p[1]], []]
+        else:
+            if type(p[2]) in [ast.Group, ast.Rule, ast.RuleApply]:
+                p[0] = [p[1][0], p[1][1] + [p[2]]]
+            else:
+                p[0] = [p[1][0] + [p[2]], p[1][1]]
 
     def p_statement(self, p):
         """statement : assignment
-                     | link"""
+                     | port_property
+                     | link
+                     | rule
+                     | group
+                     | apply"""
         p[0] = p[1]
 
+    def p_group(self, p):
+        """group : GROUP identifier COLON ident_list"""
+        p[0] = ast.Group(group=p[2], members=p[4], debug_info=self.debug_info(p, 1))
+
+    def p_ident_list(self, p):
+        """ident_list :
+                       | ident_list identifier COMMA
+                       | ident_list identifier"""
+        if len(p) > 2:
+            p[1].append(p[2])
+        p[0] = p[1] if len(p) > 1 else []
+
+    def p_rule(self, p):
+        """rule : RULE identifier COLON expression"""
+        p[0] = ast.Rule(rule=p[2], expression=p[4], debug_info=self.debug_info(p, 1))
+
+    def p_expression(self, p):
+        """expression : expression predicate
+                      | first_predicate"""
+        if len(p) > 2:
+            p[1].add_child(p[2])
+            p[0] = p[1]
+        else:
+            p[0] = ast.RuleExpression(first_predicate=p[1])
+
+    def p_first_predicate(self, p):
+        """first_predicate : identifier
+                           | NOT identifier
+                           | identifier LPAREN named_args RPAREN
+                           | NOT identifier LPAREN named_args RPAREN"""
+        # print p[1], p[3], self.debug_info(p, 1)
+        if len(p) == 2:
+            # identifier
+            p[0] = ast.RulePredicate(predicate=p[1], type="rule", debug_info=self.debug_info(p, 1))
+        elif len(p) == 3:
+            # NOT identifier
+            p[0] = ast.RulePredicate(predicate=p[2], type="rule", op=ast.RuleSetOp(op="~"), debug_info=self.debug_info(p, 1))
+        elif len(p) == 5:
+            # identifier LPAREN named_args RPAREN
+            p[0] = ast.RulePredicate(predicate=p[1], type="constraint", args=p[3], debug_info=self.debug_info(p, 1))
+        else:
+            # NOT identifier LPAREN named_args RPAREN
+            p[0] = ast.RulePredicate(predicate=p[2], type="constraint", op=ast.RuleSetOp(op="~"), args=p[4], debug_info=self.debug_info(p, 1))
+
+    def p_predicate(self, p):
+        """predicate : setop identifier
+                     | setop identifier LPAREN named_args RPAREN"""
+        # print p[1], p[3], self.debug_info(p, 1)
+        if len(p) == 3:
+            # setop identifier
+            p[0] = ast.RulePredicate(predicate=p[2], type="rule", op=p[1], debug_info=self.debug_info(p, 1))
+        else:
+            # setop identifier LPAREN named_args RPAREN
+            p[0] = ast.RulePredicate(predicate=p[2], type="constraint", op=p[1], args=p[4], debug_info=self.debug_info(p, 1))
+
+    def p_setop(self, p):
+        """setop : AND
+                 | OR
+                 | AND NOT
+                 | OR NOT"""
+        #print p[1], self.debug_info(p, 1)
+        if len(p) == 2:
+            p[0] = ast.RuleSetOp(op=p[1])
+        else:
+            p[0] = ast.RuleSetOp(op=p[1] + p[2])
+
+    def p_apply(self, p):
+        """apply : APPLY ident_list COLON expression
+                 | APPLY STAR ident_list COLON expression"""
+        if len(p) == 5:
+            # print p[2], p[4], self.debug_info(p, 1)
+            p[0] = ast.RuleApply(optional=False, targets=p[2], rule=p[4], debug_info=self.debug_info(p,1))
+        else:
+            # print p[2], p[3], p[5], self.debug_info(p, 1)
+            p[0] = ast.RuleApply(optional=True, targets=p[3], rule=p[5], debug_info=self.debug_info(p,1))
 
     def p_assignment(self, p):
         """assignment : IDENTIFIER COLON qualified_name LPAREN named_args RPAREN"""
         p[0] = ast.Assignment(ident=p[1], actor_type=p[3], args=p[5], debug_info=self.debug_info(p, 1))
+
+
+    def p_opt_direction(self, p):
+        """opt_direction :
+                         | LBRACK IDENTIFIER RBRACK"""
+        if len(p) == 1:
+            p[0] = None
+        else:
+            if p[2] not in ['in', 'out']:
+                info = {
+                    'line': p.lineno(2),
+                    'col': self._find_column(p.lexpos(2))
+                }
+                self.issuetracker.add_error('Invalid direction ({}).'.format(p[2]), info)
+            p[0] = p[2]
+
+
+    def p_port_property(self, p):
+        """port_property : IDENTIFIER DOT IDENTIFIER opt_direction LPAREN named_args RPAREN"""
+        p[0] = ast.PortProperty(actor=p[1], port=p[3], direction=p[4], args=p[6], debug_info=self.debug_info(p, 1))
+
+
+    def p_internal_port_property(self, p):
+        """internal_port_property : DOT IDENTIFIER opt_direction LPAREN named_args RPAREN"""
+        p[0] = ast.PortProperty(actor=None, port=p[2], direction=p[3], args=p[5], debug_info=self.debug_info(p, 1))
 
 
     def p_link(self, p):
@@ -157,7 +286,7 @@ class CalvinParser(object):
     #     p[0] = ast.Portmap(p[1], p[3])
 
     def p_void(self, p):
-        """void : VOID"""
+        """void : VOIDPORT"""
         p[0] = ast.Void(debug_info=self.debug_info(p, 1))
 
     def p_portlist(self, p):
@@ -185,12 +314,25 @@ class CalvinParser(object):
 
     def p_port(self, p):
         """port : inport
-                | internal_inport"""
+                | internal_inport
+                | transformed_inport"""
         p[0]=p[1]
 
+    def p_transformed_inport(self, p):
+        """transformed_inport : SLASH argument SLASH port
+                              | SLASH COLON identifier argument SLASH port"""
+        if len(p) > 5:
+            p[0] = ast.TransformedPort(port=p[6], value=p[4], label=p[3], debug_info=self.debug_info(p, 4))
+        else:
+            p[0] = ast.TransformedPort(port=p[4], value=p[2], debug_info=self.debug_info(p, 4))
+
     def p_implicit_port(self, p):
-        """implicit_port : argument"""
-        p[0] = ast.ImplicitPort(arg=p[1], debug_info=self.debug_info(p, 1))
+        """implicit_port : argument
+                         | COLON identifier argument"""
+        if len(p) > 2:
+            p[0] = ast.ImplicitPort(arg=p[3], label=p[2], debug_info=self.debug_info(p, 1))
+        else:
+            p[0] = ast.ImplicitPort(arg=p[1], debug_info=self.debug_info(p, 1))
 
 
     def p_inport(self, p):
@@ -236,6 +378,12 @@ class CalvinParser(object):
         """identifier : IDENTIFIER"""
         p[0] = ast.Id(ident=p[1], debug_info=self.debug_info(p, 1))
 
+    # Concatenation of strings separated only by whitespace
+    # since linebreaks are not allowed inside strings
+    def p_string(self, p):
+        """string : STRING
+                  | string STRING"""
+        p[0] = p[1] if len(p) == 2 else p[1] + p[2]
 
     def p_value(self, p):
         """value : dictionary
@@ -243,8 +391,21 @@ class CalvinParser(object):
                  | bool
                  | null
                  | NUMBER
-                 | STRING"""
+                 | string
+                 | portref"""
         p[0] = ast.Value(value=p[1], debug_info=self.debug_info(p, 1))
+
+
+    def p_portref(self, p):
+        """portref : AND IDENTIFIER DOT IDENTIFIER opt_direction
+                   | AND DOT IDENTIFIER opt_direction """
+        if len(p) == 6:
+            _, _, actor, _, port, direction = p[:]
+            ref = ast.PortRef(actor=actor, port=port, direction=direction, debug_info=self.debug_info(p, 1))
+        else:
+            _, _, _, port, direction = p[:]
+            ref = ast.InternalPortRef(port=port, direction=direction, debug_info=self.debug_info(p, 1))
+        p[0] = ref
 
 
     def p_bool(self, p):
@@ -275,7 +436,7 @@ class CalvinParser(object):
 
 
     def p_member(self, p):
-        """member : STRING COLON value"""
+        """member : string COLON value"""
         p[0] = (p[1], p[3].value)
 
 
@@ -326,18 +487,12 @@ class CalvinParser(object):
             self.issuetracker.add_error('Unexpected end of file.', info)
             return
 
-        # FIXME: Better recovery
-        # FIXME: [PP] This originated as an exception in the lexer,
-        #             there is more info to extract.
         info = {
             'line': token.lineno,
             'col': self._find_column(token.lexpos)
         }
         self.issuetracker.add_error('Syntax error.', info)
-        # print self.parser.statestack
-        # print self.parser.symstack
 
-        # Trying to recover from here...
 
     def _find_column(self, lexpos):
         last_cr = self.source_text.rfind('\n', 0, lexpos)
@@ -354,16 +509,21 @@ class CalvinParser(object):
         }
         return info
 
-    def parse(self, source_text):
+
+    def parse(self, source_text, logger=None):
         # return ir (AST) and issuetracker
         self.issuetracker = IssueTracker()
         self.source_text = source_text
+        root = None
+
         try:
-            ir = self.parser.parse(source_text)
+            root = self.parser.parse(source_text, debug=logger)
         except SyntaxError as e:
             self.issuetracker.add_error(e.text, {'line':e.lineno, 'col':e.offset})
-            ir = ast.Node()
-        return ir, self.issuetracker
+        finally:
+            ir, deploy_ir = root.children if root else (ast.Node(), ast.Node())
+
+        return ir, deploy_ir, self.issuetracker
 
 
 # FIXME: [PP] Optionally supply an IssueTracker
@@ -374,13 +534,28 @@ def calvin_parse(source_text):
 
 
 if __name__ == '__main__':
+    import os
     import sys
     import json
+    import astprint
+    import logging
+
+    logging.basicConfig(
+        level = logging.DEBUG,
+        filename = "{}/parselog.txt".format(os.path.dirname(os.path.realpath(__file__))),
+        filemode = "w",
+        format = "%(filename)10s:%(lineno)4d:%(message)s"
+    )
 
     if len(sys.argv) < 2:
+        log = logging.getLogger()
         script = 'inline'
         source_text = \
 '''
+define NODE1={"organization": "org.testexample", "name": "testNode1"}
+define NODE2={"organization": "org.testexample", "name": "testNode2"}
+
+
 define ARG=-1
 
 component Foo(arg) in -> out {
@@ -389,7 +564,7 @@ component Foo(arg) in -> out {
   Documentation please
   """
 
-  init : std.Init(data=arg)
+  init : flow.Init(data=arg)
 
   .in > init.in
   init.out > .out
@@ -402,6 +577,25 @@ print : io.Print()
 src.out > print.token
 src.out > delay.token
 delay.token > src.in
+
+src.out(routing="round-robin")
+delay.token[in](routing="round-robin")
+
+# define rules
+rule src_rule: node_attr(node_spec=NODE1)
+
+rule dst_rule: node_attr(node_spec=NODE1) | node_attr(node_spec={"name": "testNode2"})
+rule src_rule: node_attr(node_spec=NODE1) | node_attr(node_spec=NODE2) &~ current()
+rule combined_rule: dst_rule & src_rule | current()
+
+# define a group
+group group_name: actor, some_group
+
+# apply rules, '*' indicates optional rule
+apply actor: some_rule
+apply* actor, actor: some_rule
+apply actor, actor: some_rule | node_attr(node_spec=NODE1) &~ current()
+
 '''
     else:
         script = sys.argv[1]
@@ -413,8 +607,19 @@ delay.token > src.in
             print "Error: Could not read file: '%s'" % script
             sys.exit(1)
 
-    ir, it = calvin_parse(source_text)
+    parser = CalvinParser()
+    ir, deploy_ir, it = parser.parse(source_text, logger=log)
     if it.issue_count == 0:
         print "No issues"
     for i in it.formatted_issues(custom_format="{type!c}: {reason} {filename}:{line}:{col}", filename=script):
         print i
+
+    print "CalvinScript:"
+    bp = astprint.BracePrinter()
+    bp.visit(ir)
+    print
+    print "DeployScript:"
+    bp = astprint.BracePrinter()
+    bp.visit(deploy_ir)
+
+

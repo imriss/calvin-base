@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 
 
 class ClassicDelay(Actor):
@@ -49,17 +49,17 @@ class ClassicDelay(Actor):
         if self.started:
             self.start()
 
+    @stateguard(lambda self: not self.started)
     @condition(['token'], ['token'])
-    @guard(lambda self, _: not self.started)
     def start_timer(self, token):
         self.start()
-        return ActionResult(production=(token, ))
+        return (token, )
 
+    @stateguard(lambda self: self.timer and self.timer.triggered)
     @condition(['token'], ['token'])
-    @guard(lambda self, _: self.timer and self.timer.triggered)
     def passthrough(self, token):
         self.timer.ack()
-        return ActionResult(production=(token, ))
+        return (token, )
 
     action_priority = (start_timer, passthrough)
     requires = ['calvinsys.events.timer']

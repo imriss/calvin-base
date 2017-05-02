@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, condition, manage
+from calvin.actor.actor import Actor, condition, manage
 
 
 class SetLimits(Actor):
@@ -35,6 +35,6 @@ class SetLimits(Actor):
     def set_limits(self, container):
         container["upper"] = self.upper
         container["lower"] = self.lower
-        return ActionResult(production=(container,))
+        return (container,)
 
     action_priority = (set_limits, )

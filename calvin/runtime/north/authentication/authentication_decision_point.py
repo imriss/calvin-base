@@ -75,7 +75,7 @@ class AuthenticationDecisionPoint(object):
             ]
         }
         """
-        _log.debug("authenticate::request received: %s" % request)
+        _log.debug("authenticate: request = %s" % request)
         if "resource" in request and "node_id" in request["resource"]:
             try:
                 node_id = request["resource"]["node_id"]
@@ -102,39 +102,55 @@ class AuthenticationDecisionPoint(object):
         return response
 
     def authentication_decision(self, request):
-        _log.debug("authentication_decision::request%s" % request)
+        #TODO: remove debug prints (or set as DEBUG/ANALYZE) as they leak loads of information
+        _log.debug("authentication_decision: request = %s" % request)
         try:
             users_db = self.node.authentication.arp.get_users_db()
             groups_db = self.node.authentication.arp.get_groups_db()
             # Verify users against stored passwords
             subject_attributes = {}
             decision = False
-            for user in users_db['users_db']:
-                if request['subject']['user'] == user['username']:
-                    if pbkdf2_sha256.verify(request['subject']['password'],user['password']):
-                        decision = True
-                        for key in user['attributes']:
-                            if key == "groups" and groups_db:
-                                for group_key in user['attributes']['groups']:
-                                    for group_attribute in groups_db[group_key]:
-                                        if not group_attribute in subject_attributes:
+            if ('subject' in request) and ('user' in request['subject']) and (request['subject']['user'] in users_db):
+                user = users_db[request['subject']['user']]
+                if 'password' in request['subject'] and ('password' in user):
+                    try:
+                        #Verify password
+                        decision = pbkdf2_sha256.verify(request['subject']['password'], user['password'])
+                        if decision:
+                            #Password was correct
+                            if 'attributes' in user:
+                                for key in user['attributes']:
+                                    if key == "groups" and groups_db:
+                                        for group_key in user['attributes']['groups']:
+                                            if group_key in groups_db:
+                                                for group_attribute in groups_db[group_key]:
+                                                    if not group_attribute in subject_attributes:
+                                                        # If there is no key, create array and add first value
+                                                        subject_attributes.setdefault(group_attribute, []).append(groups_db[group_key][group_attribute])
+                                                    elif not groups_db[group_key][group_attribute] in subject_attributes[group_attribute]:
+                                                        # List exists, make sure we don't add same value several times
+                                                        subject_attributes[group_attribute].append(groups_db[group_key][group_attribute])
+                                    else:
+                                        if not user['attributes'][key] in subject_attributes:
                                             # If there is no key, create array and add first value
-                                            subject_attributes.setdefault(group_attribute, []).append(groups_db[group_key][group_attribute])
-                                        elif not groups_db[group_key][group_attribute] in subject_attributes[group_attribute]:
+                                            subject_attributes.setdefault(key, []).append(user['attributes'][key])
+                                        elif not user['attributes'][key] in subject_attributes[key]:
                                             # List exists, make sure we don't add same value several times
-                                            subject_attributes[group_attribute].append(groups_db[group_key][group_attribute])
+                                            subject_attributes[key].append(user['attributes'][key])
                             else:
-                                if not user['attributes'][key] in subject_attributes:
-                                    # If there is no key, create array and add first value
-                                    subject_attributes.setdefault(key, []).append(user['attributes'][key])
-                                elif not user['attributes'][key] in subject_attributes[key]:
-                                    # List exists, make sure we don't add same value several times
-                                    subject_attributes[key].append(user['attributes'][key])
-                        return (decision, subject_attributes)
-                    else:
-                        decision = False
-                        return (decision, None)
+                                _log.error("No attributes for user={}".format(user))
+                            return (decision, subject_attributes)
+                        else:
+                            _log.error("Supplied password is not correct")
+                    except Exception as err:
+                        _log.error("PBKDF calculation failed, err={}".format(err))
+                else:
+                    _log.error("No password in request or no password in database")
+                    return (decision, None)
+            else:
+                _log.error("Incorrectly formated request or user not allowed: \n\trequest={}".format(request))
             return (decision, None)
-        except Exception:
+        except Exception as err:
+            _log.error("authentication_decision: Authentication failed, err={}".format(err))
             return (False, None)
  

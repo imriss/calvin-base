@@ -24,7 +24,7 @@ import uuid
 import Queue
 import multiprocessing
 import traceback
-#
+
 from mock import Mock
 from twisted.internet import reactor
 
@@ -44,9 +44,25 @@ def cleanup(request):
     print "hejsan"
 """
 
+def slay(plist):
+    import signal
+    for p in plist:
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=.2)
+            if p.is_alive():
+                print "Warning: process %s still alive slay!!" % p._name
+                os.kill(p.pid, signal.SIGKILL)
+    time.sleep(.1)
+    if len(multiprocessing.active_children()) > 1:
+        print "Error: children is still alive", multiprocessing.active_children()
+        for a in multiprocessing.active_children():
+            a.terminate()
+
 class BaseTHandler(multiprocessing.Process):
-    def __init__(self, uri, outqueue, inqueue):
+    def __init__(self, uri, outqueue, inqueue, timeout=5):
         multiprocessing.Process.__init__(self)
+        self._timeout = timeout
         self._item = None
         self._uri = uri
         self._outqueue = outqueue
@@ -63,7 +79,9 @@ class BaseTHandler(multiprocessing.Process):
             stack = []
         self._outqueue.put([test, stack, variables])
 
-    def _stop_reactor(self):
+    def _stop_reactor(self, timeout=False):
+        if timeout:
+            self.__timeout()
         if self._item:
             # Server not stopped fail
             self._return(False, {'self._item': repr(self._item)})
@@ -85,28 +103,36 @@ class BaseTHandler(multiprocessing.Process):
             reactor.callFromThread(func, *cmd[1], **cmd[2])
         print("%s - Read thread died" % self._name)
 
-    def start(self, timeout=10):
-        self._timeout = timeout
+    def start(self):
         self._running = True
+        self.daemon = True
         multiprocessing.Process.start(self)
 
+    def __timeout(self, command=None, *args):
+        print("Timeout in", self)
+        self._return("timeout", {command: args})
+
     def _base_run(self):
-        reactor.callLater(self._timeout, self._stop_reactor)
+        # make it work with twisted py.test plugin also
+        reactor._started = False
+        print "timeout %s", self._timeout
+        reactor.callLater(self._timeout, self._stop_reactor, timeout=True)
         reactor.callInThread(self._read_thread)
-        if not reactor.running:
-            reactor.run()
+        reactor.run()
 
     def run(self):
         self._base_run()
 
-class ServerHandler(BaseTHandler):
+class TransportTestServerHandler(BaseTHandler):
     def __init__(self, *args, **kwargs):
-        self._name = "ServerHandler"
+        self._name = "TestServerHandler"
         BaseTHandler.__init__(self, *args, **kwargs)
+        self._tp = None
 
     def get_callbacks(self):
         return {'server_started': [CalvinCB(self._server_started)],
                 'server_stopped': [CalvinCB(self._server_stopped)],
+                'join_failed': [CalvinCB(self._join_failed)],
                 'peer_disconnected': [CalvinCB(self._peer_disconnected)],
                 'peer_connected': [CalvinCB(self._peer_connected)]}
 
@@ -118,8 +144,12 @@ class ServerHandler(BaseTHandler):
         transport.callback_register('join_finished', CalvinCB(self._join_finished))
         transport.callback_register('data_received', CalvinCB(self._data_received))
 
+    def _join_failed(self, transport, _id, uri, is_orginator, reason):
+        _log.debug("Server join failed on uri %s, reason %s", uri, reason)
+        self._return('server_join_failed', {'transport': repr(transport), 'uri': uri, 'reason': reason})
+
     def _join_finished(self, transport, _id, uri, is_orginator):
-        print("server_join_finshed", transport, _id, uri)
+        print("server_join_finished", transport, _id, uri)
         self._return(transport._coder is not None and _id and uri, {'transport._coder': transport._coder , 'id': _id, 'uri': uri})
         self._return('server_join_finished', {'transport': repr(transport), '_id': _id, 'uri': uri})
         pass
@@ -146,7 +176,7 @@ class ServerHandler(BaseTHandler):
             self._stop_server()
 
         # Timeout
-        reactor.callLater(3, self._stop_reactor)
+        reactor.callLater(1, self._stop_reactor)
 
     def _server_started(self, server, port):
         print("Server started", server, port)
@@ -157,7 +187,7 @@ class ServerHandler(BaseTHandler):
         self._return('server_started', port)
 
     def _start_server(self):
-        self._ttf.listen(self._uri)
+        self._tp = self._ttf.listen(self._uri)
 
     def run(self):
         print("start server")
@@ -169,14 +199,12 @@ class ServerHandler(BaseTHandler):
         comand(args)
         reactor.callLater(0, self.start_server)
 
-    def _timeout(self, command, *args):
-        self._return(["timeout", comand, args])
-
-class ClientHandler(BaseTHandler):
+class TransportTestClientHandler(BaseTHandler):
     def __init__(self, *args, **kwargs):
-        self._name = "ServerHandler"
+        self._name = "TestClientHandler"
         self._port = None
         self._stop = False
+        self._tp = None
         BaseTHandler.__init__(self, *args, **kwargs)
 
     def set_ttf(self, ttf):
@@ -188,6 +216,8 @@ class ClientHandler(BaseTHandler):
 
     def get_callbacks(self):
         return {'peer_disconnected': [CalvinCB(self._peer_disconnected)],
+                'peer_connection_failed': [CalvinCB(self._connection_failed)],
+                'join_failed': [CalvinCB(self._join_failed)],
                 'peer_connected': [CalvinCB(self._peer_connected)]}
 
     def _data_received(self, data):
@@ -201,8 +231,16 @@ class ClientHandler(BaseTHandler):
         self._return('client_connected', {'transport': repr(transport), 'uri': uri})
         self._item = transport
 
+    def _connection_failed(self, tp_link, uri, reason):
+        _log.debug("Client connection failed on uri %s, reason %s", uri, reason)
+        self._return('client_connection_failed', {'link': repr(tp_link), 'uri': uri, 'reason': reason})
+
+    def _join_failed(self, transport, _id, uri, is_orginator, reason):
+        _log.debug("Client join failed on uri %s, reason %s", uri, reason)
+        self._return('client_join_failed', {'transport': repr(transport), 'uri': uri, 'reason': reason})
+
     def _join_finished(self, transport, _id, uri, is_orginator):
-        print("client_join_finshed", transport, _id, uri)
+        print("client_join_finished", transport, _id, uri)
         self._return(transport._coder is not None and _id and uri, {'transport._coder': transport._coder , 'id': _id, 'uri': uri})
         self._return('client_join_finished', {'transport': repr(transport), '_id': _id, 'uri': uri})
 
@@ -228,22 +266,36 @@ class ClientHandler(BaseTHandler):
         # Timeout
         reactor.callLater(1, self._stop_reactor)
 
+    def _join(self):
+         self._tp = self._ttf.join(self._uri)
+
     def run(self):
         print("start client")
         self._uri  =  "%s:%s" % (self._uri, self._port)
-        reactor.callLater(0, self._ttf.join, self._uri)
+        reactor.callLater(0, self._join)
         self._base_run()
         print("client finished")
 
+class ConnectionFailed(Exception):
+    pass
+
+class ServerJoinFailed(Exception):
+    pass
+
+class ClientJoinFailed(Exception):
+    pass
+
 # @pytest.mark.interactive
 class TestTransportServer(object):
-    _mmanager = multiprocessing.Manager()
+
+    @pytest.mark.essential
     def test_start_stop(self, monkeypatch):
+        _mmanager = multiprocessing.Manager()
+        shqs = [_mmanager.Queue(), _mmanager.Queue()]
+        sh = TransportTestServerHandler("calvinip://localhost", shqs[0], shqs[1], timeout=2)
 
-        shqs = [self._mmanager.Queue(), self._mmanager.Queue()]
-        sh = ServerHandler("calvinip://localhost", shqs[0], shqs[1])
-
-        ttf = calvinip_transport.CalvinTransportFactory(str(uuid.uuid4()), sh.get_callbacks())
+        ttf_uuid = str(uuid.uuid4())
+        ttf = calvinip_transport.CalvinTransportFactory(ttf_uuid, ttf_uuid, sh.get_callbacks())
 
         sh.set_ttf(ttf)
         sh.start()
@@ -254,7 +306,7 @@ class TestTransportServer(object):
             while sh.is_alive():
                 try:
                     mess = shqs[0].get(timeout=.3)
-                    #print(mess)
+                    # print(mess)
                 except:
                     continue
 
@@ -262,11 +314,12 @@ class TestTransportServer(object):
                     print(mess[1])
                     raise Exception("Timeout: %s" % "\n".join(mess[1][11:]))
                 elif mess[0] == 'server_started':
+                    pass
                     shqs[1].put(['stop', [], {}])
                 elif mess[0] == 'server_stopped':
                     break
                 else:
-                    #print mess
+                    # print mess
                     if not mess[0]:
                         for a in mess[1]:
                             print a,
@@ -274,13 +327,14 @@ class TestTransportServer(object):
                             print "%s = %s" % (k, repr(v))
                         raise Exception("\n".join(mess[1][11:]))
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             error = e
 
         shqs[1].put(['stop', [], {}])
         sh.join(timeout=.2)
 
-        if sh.is_alive():
-            sh.terminate()
+        slay([sh])
 
         if error:
             pytest.fail(error)
@@ -292,21 +346,25 @@ class TestTransportServer(object):
     def test_peer_connected(self, monkeypatch):
         pass
 
-# @pytest.mark.interactive
+
 @pytest.mark.slow
 class TestTransportClient(object):
     test_nodes = 2
-    _mmanager = multiprocessing.Manager()
 
+    @pytest.mark.essential
     def test_connect(self, monkeypatch):
         queues = []
-        shqs = [self._mmanager.Queue(), self._mmanager.Queue()]
-        chqs = [self._mmanager.Queue(), self._mmanager.Queue()]
-        sh = ServerHandler("calvinip://127.0.0.1", shqs[0], shqs[1])
-        ch = ClientHandler("calvinip://127.0.0.1", chqs[0], chqs[1])
+        _mmanager = multiprocessing.Manager()
+        shqs = [_mmanager.Queue(), _mmanager.Queue()]
+        chqs = [_mmanager.Queue(), _mmanager.Queue()]
+        sh = TransportTestServerHandler("calvinip://127.0.0.1", shqs[0], shqs[1], timeout=2)
+        ch = TransportTestClientHandler("calvinip://127.0.0.1", chqs[0], chqs[1], timeout=2)
 
-        ttfs = calvinip_transport.CalvinTransportFactory(str(uuid.uuid4()), sh.get_callbacks())
-        ttfc = calvinip_transport.CalvinTransportFactory(str(uuid.uuid4()), ch.get_callbacks())
+
+        ttfs_uuid = str(uuid.uuid4())
+        ttfs = calvinip_transport.CalvinTransportFactory(ttfs_uuid, ttfs_uuid, sh.get_callbacks())
+        ttfc_uuid = str(uuid.uuid4())
+        ttfc = calvinip_transport.CalvinTransportFactory(ttfc_uuid, ttfc_uuid, ch.get_callbacks())
 
         sh.set_ttf(ttfs)
         ch.set_ttf(ttfc)
@@ -340,12 +398,20 @@ class TestTransportClient(object):
                         ch.set_port(mess[2])
                         ch.start()
                     elif mess[0] == 'client_disconnected':
+                        if mess[2]['reason'] != "OK":
+                            raise Exception("Did not disconnect cleanly")
                         cstop = True
                         stop = (sstop and cstop)
                     elif mess[0] == 'client_join_finished':
                         stop = True
+                    elif mess[0] == 'client_join_failed':
+                        raise ClientJoinFailed(str(mess[2]))
+                    elif mess[0] == 'server_join_failed':
+                        raise ServerJoinFailed(str(mess[2]))
+                    elif mess[0] == 'client_connection_failed':
+                        raise ConnectionFailed(str(mess[1:]))
                     else:
-                        #print mess
+                        # print mess
                         if not mess[0]:
                             for a in mess[1][11:-1]:
                                 print a,
@@ -359,16 +425,259 @@ class TestTransportClient(object):
             print(repr(tq))
             tq[1].put(['stop', [], {}])
 
-        print sh.join(timeout=.5)
-        print ch.join(timeout=.5)
+        time.sleep(.2)
 
-        if sh.is_alive():
-            sh.terminate()
-        if ch.is_alive():
-            ch.terminate()
+        slay([sh, ch])
 
         if error:
             pytest.fail(error)
+
+    def test_connect_client_join_fail(self, monkeypatch):
+        _mmanager = multiprocessing.Manager()
+        queues = []
+        shqs = [_mmanager.Queue(), _mmanager.Queue()]
+        chqs = [_mmanager.Queue(), _mmanager.Queue()]
+        sh = TransportTestServerHandler("calvinip://127.0.0.1", shqs[0], shqs[1])
+        ch = TransportTestClientHandler("calvinip://127.0.0.1", chqs[0], chqs[1])
+
+        ttfs_uuid = str(uuid.uuid4())
+        ttfs = calvinip_transport.CalvinTransportFactory(ttfs_uuid, ttfs_uuid, sh.get_callbacks())
+        ttfc_uuid = str(uuid.uuid4())
+        ttfc = calvinip_transport.CalvinTransportFactory(ttfc_uuid, ttfc_uuid, ch.get_callbacks())
+
+        sh.set_ttf(ttfs)
+        ch.set_ttf(ttfc)
+
+        monkeypatch.setattr(ttfc, "_client_validator", lambda x: False)
+
+        sh.start()
+
+        queues = [shqs, chqs]
+        cstop = sstop = False
+        stop = False
+        error = None
+
+        try:
+            while not stop:
+                for q in queues:
+                    try:
+                        mess = q[0].get(timeout=.1)
+                        #print(mess[0])
+                    except:
+                        continue
+
+                    if mess[0] == 'timeout':
+                        print(mess[1])
+                        # TODO: terminate
+                        raise Exception("Timeout: %s" % "\n".join(mess[1][11:]))
+                    elif mess[0] == 'server_stopped':
+                        print "Hej hej"
+                        sstop = True
+                        stop = (sstop and cstop)
+                    elif mess[0] == 'server_started':
+                        ch.set_port(mess[2])
+                        ch.start()
+                    elif mess[0] == 'client_disconnected':
+                        cstop = True
+                        stop = (sstop and cstop)
+                    elif mess[0] == 'client_join_finished':
+                        stop = True
+                    elif mess[0] == 'client_join_failed':
+                        raise ClientJoinFailed(str(mess[2]))
+                    elif mess[0] == 'server_join_failed':
+                        raise ServerJoinFailed(str(mess[2]))
+                    elif mess[0] == 'client_connection_failed':
+                        raise ConnectionFailed(str(mess[2]))
+                    else:
+                        # print mess
+                        if not mess[0]:
+                            for a in mess[1][11:-1]:
+                                print a,
+                            for k,v in mess[2].items():
+                                print "%s = %s" % (k, repr(v))
+                            raise Exception("\n".join(mess[1][11:]))
+        except Exception as e:
+            error = e
+
+        for tq in queues:
+            print(repr(tq))
+            tq[1].put(['stop', [], {}])
+
+        slay([sh, ch])
+
+        if error:
+            with pytest.raises(ClientJoinFailed):
+                import traceback
+                traceback.print_exc(error)
+                raise error
+        else:
+            pytest.fail("No exception")
+
+
+
+    def test_connect_server_join_fail(self, monkeypatch):
+        _mmanager = multiprocessing.Manager()
+        queues = []
+        shqs = [_mmanager.Queue(), _mmanager.Queue()]
+        chqs = [_mmanager.Queue(), _mmanager.Queue()]
+        sh = TransportTestServerHandler("calvinip://127.0.0.1", shqs[0], shqs[1])
+        ch = TransportTestClientHandler("calvinip://127.0.0.1", chqs[0], chqs[1])
+
+        ttfs_uuid = str(uuid.uuid4())
+        ttfs = calvinip_transport.CalvinTransportFactory(ttfs_uuid, ttfs_uuid, sh.get_callbacks())
+        ttfc_uuid = str(uuid.uuid4())
+        ttfc = calvinip_transport.CalvinTransportFactory(ttfc_uuid, ttfc_uuid, ch.get_callbacks())
+
+        sh.set_ttf(ttfs)
+        ch.set_ttf(ttfc)
+
+        monkeypatch.setattr(ttfs, "_client_validator", lambda x: False)
+
+        sh.start()
+
+        queues = [shqs, chqs]
+        cstop = sstop = False
+        stop = False
+        error = None
+
+        try:
+            while not stop:
+                for q in queues:
+                    try:
+                        mess = q[0].get(timeout=.1)
+                        #print(mess[0])
+                    except:
+                        continue
+
+                    if mess[0] == 'timeout':
+                        print(mess[1])
+                        # TODO: terminate
+                        raise Exception("Timeout: %s" % "\n".join(mess[1][11:]))
+                    elif mess[0] == 'server_stopped':
+                        print "Hej hej"
+                        sstop = True
+                        stop = (sstop and cstop)
+                    elif mess[0] == 'server_started':
+                        ch.set_port(mess[2])
+                        ch.start()
+                    elif mess[0] == 'client_disconnected':
+                        cstop = True
+                        stop = (sstop and cstop)
+                    elif mess[0] == 'client_join_finished':
+                        stop = True
+                    elif mess[0] == 'client_join_failed':
+                        raise ClientJoinFailed(str(mess[2]))
+                    elif mess[0] == 'server_join_failed':
+                        raise ServerJoinFailed(str(mess[2]))
+                    elif mess[0] == 'client_connection_failed':
+                        raise ConnectionFailed(str(mess[2]))
+                    else:
+                        # print mess
+                        if not mess[0]:
+                            for a in mess[1][11:-1]:
+                                print a,
+                            for k,v in mess[2].items():
+                                print "%s = %s" % (k, repr(v))
+                            raise Exception("\n".join(mess[1][11:]))
+        except Exception as e:
+            error = e
+
+        for tq in queues:
+            print(repr(tq))
+            tq[1].put(['stop', [], {}])
+
+        slay([sh, ch])
+
+        if error:
+            with pytest.raises(ServerJoinFailed):
+                import traceback
+                traceback.print_exc(error)
+                raise error
+        else:
+            pytest.fail("No exception")
+
+
+
+    def test_connect_fail(self, monkeypatch):
+        _mmanager = multiprocessing.Manager()
+        queues = []
+        shqs = [_mmanager.Queue(), _mmanager.Queue()]
+        chqs = [_mmanager.Queue(), _mmanager.Queue()]
+        sh = TransportTestServerHandler("calvinip://127.0.0.1", shqs[0], shqs[1])
+        ch = TransportTestClientHandler("calvinip://127.0.0.1", chqs[0], chqs[1])
+
+        ttfs_uuid = str(uuid.uuid4())
+        ttfs = calvinip_transport.CalvinTransportFactory(ttfs_uuid, ttfs_uuid, sh.get_callbacks())
+        ttfc_uuid = str(uuid.uuid4())
+        ttfc = calvinip_transport.CalvinTransportFactory(ttfc_uuid, ttfc_uuid, ch.get_callbacks())
+
+        sh.set_ttf(ttfs)
+        ch.set_ttf(ttfc)
+
+        sh.start()
+        #ch.start()
+
+        queues = [shqs, chqs]
+        cstop = sstop = False
+        stop = False
+        error = None
+
+        try:
+            while not stop:
+                for q in queues:
+                    try:
+                        mess = q[0].get(timeout=.1)
+                        #print(mess[0])
+                    except:
+                        continue
+
+                    if mess[0] == 'timeout':
+                        print(mess[1])
+                        # TODO: terminate
+                        raise Exception("Timeout: %s" % "\n".join(mess[1][11:]))
+                    elif mess[0] == 'server_stopped':
+                        print "Hej hej"
+                        sstop = True
+                        stop = (sstop and cstop)
+                    elif mess[0] == 'server_started':
+                        ch.set_port(str(int(mess[2])+1))
+                        ch.start()
+                    elif mess[0] == 'client_disconnected':
+                        cstop = True
+                        stop = (sstop and cstop)
+                    elif mess[0] == 'client_join_finished':
+                        stop = True
+                    elif mess[0] == 'client_join_failed':
+                        raise ClientJoinFailed(str(mess[2]))
+                    elif mess[0] == 'server_join_failed':
+                        raise ServerJoinFailed(str(mess[2]))
+                    elif mess[0] == 'client_connection_failed':
+                        raise ConnectionFailed(str(mess[2]))
+                    else:
+                        # print mess
+                        if not mess[0]:
+                            for a in mess[1][11:-1]:
+                                print a,
+                            for k,v in mess[2].items():
+                                print "%s = %s" % (k, repr(v))
+                            raise Exception("\n".join(mess[1][11:]))
+        except Exception as e:
+            error = e
+
+        for tq in queues:
+            print "hej", repr(tq)
+            tq[1].put(['stop', [], {}])
+
+        print sh, ch
+        slay([sh, ch])
+
+        if error:
+            with pytest.raises(ConnectionFailed):
+                import traceback
+                traceback.print_exc(error)
+                raise error
+        else:
+            pytest.fail("No exception")
 
     def test_data(self, monkeypatch):
         pass

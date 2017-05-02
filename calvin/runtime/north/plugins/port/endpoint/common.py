@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from calvin.runtime.north.plugins.port import DISCONNECT
+
 class Endpoint(object):
 
     """docstring for Endpoint"""
@@ -22,6 +24,7 @@ class Endpoint(object):
         super(Endpoint, self).__init__()
         self.port = port
         self.former_peer_id = former_peer_id
+        self.remaining_tokens = {}
 
     def __str__(self):
         return "%s(port_id=%s)" % (self.__class__.__name__, self.port.id)
@@ -48,5 +51,5 @@ class Endpoint(object):
     def attached(self):
         pass
 
-    def detached(self):
+    def detached(self, terminate=DISCONNECT.TEMPORARY):
         pass

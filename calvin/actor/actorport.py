@@ -17,9 +17,10 @@
 from calvin.utilities import calvinuuid
 from calvin.utilities.calvin_callback import CalvinCB
 from calvin.runtime.north.plugins.port import queue
-from calvin.runtime.north.plugins.port import endpoint
 import calvin.requests.calvinresponse as response
 from calvin.utilities.calvinlogger import get_logger
+from calvin.runtime.north.plugins.port import DISCONNECT
+
 import copy
 
 _log = get_logger(__name__)
@@ -28,7 +29,7 @@ _log = get_logger(__name__)
 class Port(object):
     """docstring for Port"""
 
-    def __init__(self, name, owner):
+    def __init__(self, name, owner, properties=None):
         super(Port, self).__init__()
         # Human readable port name
         self.name = name
@@ -41,9 +42,38 @@ class Port(object):
         self.properties = {}
         self.properties['routing'] = 'default'
         self.properties['nbr_peers'] = 1
+        if properties:
+            self.properties.update(properties)
 
     def __str__(self):
         return "%s id=%s" % (self.name, self.id)
+
+    def set_config(self, config):
+        """
+        Set additional config information on the port.
+        The default behaviour is to delegate the information to the port's queue.
+        The 'config' parameter is a dictionary with settings.
+        """
+
+        def _local_name(peer_actor):
+            _, local_name = peer_actor._name.rsplit(':', 1)
+            return local_name
+
+        port_to_id = {'{}.{}'.format(_local_name(ep.peer_port.owner), ep.peer_port.name) : ep.peer_port.id for ep in self.endpoints}
+        if 'port-order' in config:
+            # Remap from actor.port to port_id
+            # FIXME: Will not work in the general case.
+            #        Extend calvinsys with runtime API and use that instead
+            port_order = config['port-order']
+            config['port-order'] = [port_to_id[p] for p in port_order]
+        if 'port-mapping' in config:
+            # Remap from actor.port to port_id
+            # FIXME: Will not work in the general case.
+            #        Extend calvinsys with runtime API and use that instead
+            mapping = config['port-mapping']
+            config['port-mapping'] = {k:port_to_id[p] for k,p in mapping.iteritems()}
+
+        self.queue.set_config(config)
 
     def set_queue(self, new_queue):
         if self.queue is None:
@@ -63,9 +93,17 @@ class Port(object):
             # Want to replace an existing queue type (e.g. during migration)
             raise NotImplementedError("FIXME Can't swap queue types")
 
-    def _state(self):
+    def _state(self, remap=None):
         """Return port state for serialization."""
-        return {'name': self.name, 'id': self.id, 'queue': self.queue._state(), 'properties': self.properties}
+        if remap is None:
+            return {'name': self.name, 'id': self.id, 'queue': self.queue._state(), 'properties': self.properties}
+        else:
+            return {
+                'name': self.name,
+                'id': remap[self.id],
+                'queue': self.queue._state(remap),
+                'properties': self.properties
+            }
 
     def _set_state(self, state):
         """Set port state."""
@@ -88,11 +126,9 @@ class Port(object):
         raise Exception("Can't detach endpoint from  port %s.%s with id: %s" % (
             self.owner.name, self.name, self.id))
 
-    def disconnect(self):
-        """Disconnect port from counterpart. Raises an exception if port is not connected."""
-        # FIXME: Implement disconnect
-        raise Exception("Can't disconnect port %s.%s with id: %s" % (
-            self.owner.name, self.name, self.id))
+    def disconnect(self, peer_ids, terminate):
+        """Disconnect port from counterpart."""
+        raise Exception("Must be implemented in sub-classes")
 
     @property
     def direction(self):
@@ -101,72 +137,158 @@ class Port(object):
 
 class InPort(Port):
 
-    """An inport can have only one endpoint."""
+    """An inport can have many endpoints."""
 
-    def __init__(self, name, owner):
-        super(InPort, self).__init__(name, owner)
-        self.endpoint = endpoint.Endpoint(self)
+    def __init__(self, name, owner, properties=None):
+        super(InPort, self).__init__(name, owner, properties)
         self.properties['direction'] = 'in'
+        self.endpoints = []
 
     def __str__(self):
         s = super(InPort, self).__str__()
-        return s + " " + str(self.endpoint)
+        s = s + "%s: %s\n" % (self.properties.get('routing','default'), self.properties.get('nbr_peers', 1))
+        s = s + " [ "
+        for ep in self.endpoints:
+            s = s + str(ep) + " "
+        s = s + "]"
+        return s
 
     def is_connected(self):
-        return self.endpoint.is_connected()
+        if len(self.endpoints) < self.properties.get('nbr_peers', 1):
+            return False
+        for ep in self.endpoints:
+            if not ep.is_connected():
+                return False
+        return True
 
     def is_connected_to(self, peer_id):
-        return self.endpoint.is_connected() and self.endpoint.get_peer()[1] == peer_id
+        for ep in self.endpoints:
+            if ep.get_peer()[1] == peer_id:
+                return True
+        return False
 
     def attach_endpoint(self, endpoint_):
-        old_endpoint = self.endpoint
-        if type(old_endpoint) is not endpoint.Endpoint:
+        peer_id = endpoint_.peer_id
+        # Check if this is a reconnect after migration
+        match = [e for e in self.endpoints if e.peer_id == peer_id]
+        if not match:
+            old_endpoint = None
+        else:
+            old_endpoint = match[0]
             self.detach_endpoint(old_endpoint)
-        self.endpoint = endpoint_
-        self.endpoint.attached()
-        self.owner.did_connect(self)
+
+        self.endpoints.append(endpoint_)
+        endpoint_.attached()
+        nbr_peers = len(self.queue.get_peers())
+        if nbr_peers > self.properties['nbr_peers']:
+            # We have more peers due to replication
+            self.properties['nbr_peers'] = nbr_peers
+        else:
+            # No need to tell actor it could be fully connected since it was that also before
+            self.owner.did_connect(self)
         return old_endpoint
 
     def detach_endpoint(self, endpoint_):
         # Only called from attach_endpoint with the old endpoint
-        if not self.endpoint == endpoint_:
-            _log.warning("Inport: No such endpoint")
+        if endpoint_ not in self.endpoints:
+            _log.warning("Outport: No such endpoint")
             return
-        self.endpoint = endpoint.Endpoint(self, former_peer_id=endpoint_.get_peer()[1])
+        self.endpoints.remove(endpoint_)
 
-    def disconnect(self, peer_ids=None):
-        # Ignore peer_ids since we can only have one peer
-        self.owner.did_disconnect(self)
-        endpoints = [self.endpoint]
-        self.endpoint = endpoint.Endpoint(self, former_peer_id=self.endpoint.get_peer()[1])
+    def disconnect(self, peer_ids=None, terminate=DISCONNECT.TEMPORARY):
+        if peer_ids is None:
+            endpoints = self.endpoints
+        else:
+            endpoints = [e for e in self.endpoints if e.get_peer()[1] in peer_ids]
+        _log.debug("actorinport.disconnect %s remove: %s current: %s %s" % (self.id, peer_ids, [e.get_peer()[1] for e in self.endpoints], DISCONNECT.reverse_mapping[terminate]))
+        # Remove all endpoints corresponding to the peer ids
+        self.endpoints = [e for e in self.endpoints if e not in endpoints]
+        for e in endpoints:
+            e.detached(terminate=terminate)
+        if terminate >= DISCONNECT.TERMINATE:
+            self.properties['nbr_peers'] -= len(endpoints)
+        exhausting = self.queue.is_exhausting()
+        if len(self.endpoints) == 0 and not exhausting:
+            self.owner.did_disconnect(self)
+        _log.debug("actorinport.disconnected %s removed: %s current: %s" % (self.id, peer_ids, [e.get_peer()[1] for e in self.endpoints]))
         return endpoints
+
+    def any_outstanding_exhaustion_tokens(self):
+        try:
+            return self.queue.any_outstanding_exhaustion_tokens()
+        except AttributeError:
+            # When not implemented by queue assume it's not needed
+            return False
+
+    def exhausted_tokens(self, tokens):
+        _log.debug("actorinport.exhausted_tokens %s %s" % (self.owner._id, self.id))
+        self.queue.set_exhausted_tokens(tokens)
+        exhausting = self.queue.is_exhausting()
+        if len(self.endpoints) == 0 and not exhausting:
+            self.owner.did_disconnect(self)
+            _log.debug("actorinport.exhausted_tokens did_disconnect")
+
+    def finished_exhaustion(self):
+        if len(self.endpoints) == 0 and not self.queue.is_exhausting():
+            self.owner.did_disconnect(self)
+            _log.debug("actorinport.finished_exhaustion did_disconnect %s" % self.id)
 
     def peek_token(self, metadata=None):
         """Used by actor (owner) to peek a token from the port. Following peeks will get next token. Reset with peek_cancel."""
+        if metadata is None:
+            metadata = self.id
         return self.queue.peek(metadata)
 
     def peek_cancel(self, metadata=None):
         """Used by actor (owner) to cancel port peeking to front token."""
+        if metadata is None:
+            metadata = self.id
         return self.queue.cancel(metadata)
 
     def peek_commit(self, metadata=None):
-        """Used by actor (owner) to cancel port peeking to front token."""
-        return self.queue.commit()
+        """Used by actor (owner) to commit port peeking to front token."""
+        if metadata is None:
+            metadata = self.id
+        # The return has information on if the queue exhausted the remaining tokens
+        return self.queue.commit(metadata)
+
+    def read(self, metadata=None):
+        """
+        Used by actor (owner) to read a token from the port.
+        Returns tuple (token, exhaust) where exhaust is port (exhausted) or None (not exhausted)
+        """
+        # FIXME: We no longer need the peek/commit/cancel functionality.
+        #        Queues should be changed accordingly, and this method should use queue.read()
+        if metadata is None:
+            metadata = self.id
+        token = self.peek_token(metadata)
+        exhausted = self.peek_commit(metadata)
+        return (token, exhausted)
 
     def tokens_available(self, length, metadata=None):
         """Used by actor (owner) to check number of tokens on the port."""
+        if metadata is None:
+            metadata = self.id
         return self.queue.tokens_available(length, metadata)
 
     def get_peers(self):
-        return [self.endpoint.get_peer()]
+        peers = []
+        for ep in self.endpoints:
+            peers.append(ep.get_peer())
+        queue_peers = self.queue.get_peers()
+        if queue_peers is not None and len(peers) < len(queue_peers):
+            all = set(queue_peers)
+            all -= set([p[1] for p in peers])
+            peers.extend([(None, p) for p in all])
+        return peers
 
 
 class OutPort(Port):
 
     """An outport can have many endpoints."""
 
-    def __init__(self, name, owner):
-        super(OutPort, self).__init__(name, owner)
+    def __init__(self, name, owner, properties=None):
+        super(OutPort, self).__init__(name, owner, properties)
         self.properties['routing'] = 'fanout'
         self.properties['direction'] = 'out'
         self.endpoints = []
@@ -206,7 +328,13 @@ class OutPort(Port):
 
         self.endpoints.append(endpoint_)
         endpoint_.attached()
-        self.owner.did_connect(self)
+        nbr_peers = len(self.queue.get_peers())
+        if nbr_peers > self.properties['nbr_peers']:
+            # We have more peers due to replication
+            self.properties['nbr_peers'] = nbr_peers
+        else:
+            # No need to tell actor it could be fully connected since it was that also before
+            self.owner.did_connect(self)
         return old_endpoint
 
     def detach_endpoint(self, endpoint_):
@@ -216,32 +344,42 @@ class OutPort(Port):
             return
         self.endpoints.remove(endpoint_)
 
-    def disconnect(self, peer_ids=None):
+    def disconnect(self, peer_ids=None, terminate=DISCONNECT.TEMPORARY):
         if peer_ids is None:
             endpoints = self.endpoints
         else:
             endpoints = [e for e in self.endpoints if e.get_peer()[1] in peer_ids]
+        _log.debug("actoroutport.disconnect   remove: %s current: %s %s" % (peer_ids, [e.get_peer()[1] for e in self.endpoints], DISCONNECT.reverse_mapping[terminate]))
         # Remove all endpoints corresponding to the peer ids
         self.endpoints = [e for e in self.endpoints if e not in endpoints]
         for e in endpoints:
-            e.detached()
-        self.owner.did_disconnect(self)
+            e.detached(terminate=terminate)
+        if terminate:
+            self.properties['nbr_peers'] -= len(endpoints)
+        if len(self.endpoints) == 0:
+            self.owner.did_disconnect(self)
+        _log.debug("actoroutport.disconnected remove: %s current: %s" % (peer_ids, [e.get_peer()[1] for e in self.endpoints]))
         return endpoints
+
+    def exhausted_tokens(self, tokens):
+        _log.debug("actoroutport.exhausted_tokens %s %s" % (self.owner._id, self.id))
+        self.queue.set_exhausted_tokens(tokens)
 
     def write_token(self, data):
         """docstring for write_token"""
-        self.queue.write(data)
+        self.queue.write(data, self.id)
 
     def tokens_available(self, length):
         """Used by actor (owner) to check number of token slots available on the port."""
-        return self.queue.slots_available(length)
+        return self.queue.slots_available(length, self.id)
 
     def get_peers(self):
         peers = []
         for ep in self.endpoints:
             peers.append(ep.get_peer())
-        if len(peers) < len(self.queue.readers):
-            all = copy.copy(self.queue.readers)
+        queue_peers = self.queue.get_peers()
+        if queue_peers is not None and len(peers) < len(queue_peers):
+            all = set(queue_peers)
             all -= set([p[1] for p in peers])
             peers.extend([(None, p) for p in all])
         return peers
@@ -275,7 +413,7 @@ class PortMeta(object):
         if self.node_id is None:
             try:
                 self.retrieve(callback=None, local_only=True)
-            except:
+            except response.CalvinResponseException:
                 return False
         return self.node_id == self.pm.node.id
 
@@ -307,10 +445,10 @@ class PortMeta(object):
             Node id is always retrieved.
             local_only means only looks locally for the port.
         """
-        try:
+        direction = None
+        if self.properties and 'direction' in self.properties:
             direction = self.properties['direction']
-        except:
-            direction = None
+
         try:
             self._port = self.pm._get_local_port(self.actor_id, self.port_name, direction, self.port_id)
             # Found locally
@@ -323,15 +461,15 @@ class PortMeta(object):
             if callback:
                 callback(status=status, port_meta=self)
             return status
-        except:
+        except KeyError as e:
             # not local
             if local_only:
                 if self.port_id:
                     status = response.CalvinResponse(response.BAD_REQUEST,
-                                                    "Port %s must be local" % (self.port_id))
+                                                    "Port %s must be local" % (self.port_id)) # For other side
                 else:
                     status = response.CalvinResponse(response.BAD_REQUEST,
-                                                    "Port %s on actor %s must be local" %
+                                                    "Port %s on actor %s must be local" % # For other side
                                                     (self.port_name, self.actor_id))
                 raise response.CalvinResponseException(status)
 

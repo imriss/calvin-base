@@ -14,10 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 from calvin.utilities import calvinuuid
 from calvin.utilities import calvinlogger
 
 _log = calvinlogger.get_logger(__name__)
+
+def get_debug_info(start=-2, limit=10):
+    if _log.getEffectiveLevel() == logging.INFO:
+        import traceback
+        return traceback.format_stack(limit=10)[:start]
+    return None
+
+def dump_debug_info(debug_info):
+    if debug_info:
+        _log.info("Calvin callback created here: \n" + ''.join(debug_info))
 
 
 class CalvinCB(object):
@@ -30,7 +42,8 @@ class CalvinCB(object):
     """
     def __init__(self, func, *args, **kwargs):
         super(CalvinCB, self).__init__()
-        self.id = calvinuuid.uuid("CB")
+        self._debug_info = get_debug_info()
+        self._id = calvinuuid.uuid("CB")
         self.func = func
         self.args = list(args)
         self.kwargs = kwargs
@@ -57,9 +70,16 @@ class CalvinCB(object):
         """
         try:
             return self.func(*(self.args + list(args)), **dict(self.kwargs, **kwargs))
-        except:
+        except (TypeError, Exception):
+            name = "unknown"
+            if hasattr(self.func, 'name'):
+                name = self.func.name
+            elif hasattr(self.func, "__name__"):
+                name = self.func.__name__
+
             _log.exception("When callback %s %s(%s, %s) is called caught the exception" % (
-                self.func, self.func.__name__, (self.args + list(args)), dict(self.kwargs, **kwargs)))
+                self.func, name, (self.args + list(args)), dict(self.kwargs, **kwargs)))
+            dump_debug_info(self._debug_info)
 
     def __str__(self):
         return "CalvinCB - " + self.name + "(%s, %s)" % (self.args, self.kwargs)
@@ -73,7 +93,7 @@ class CalvinCBGroup(object):
     """
     def __init__(self, funcs=None):
         super(CalvinCBGroup, self).__init__()
-        self.id = calvinuuid.uuid("CBG")
+        self._id = calvinuuid.uuid("CBG")
         self.funcs = funcs if funcs else []
 
     def func_append(self, func):
@@ -89,7 +109,7 @@ class CalvinCBGroup(object):
         """
         reply = {}
         for f in self.funcs:
-            reply[f.id] = f(*args, **kwargs)
+            reply[f._id] = f(*args, **kwargs)
         return reply
 
 
@@ -116,7 +136,11 @@ class CalvinCBClass(object):
             return
         for name, cbs in callbacks.iteritems():
             if self.__callback_valid_names is None or name in self.__callback_valid_names:
-                self.__callbacks[name] = dict([(cb.id, cb) for cb in cbs])
+                self.__callbacks[name] = dict()
+                for cb in cbs:
+                    if not isinstance(cb, CalvinCB):
+                        raise Exception("One callback of name %s is not a CalvinCB object %s, %s", name, type(cb), repr(cb))
+                    self.__callbacks[name][cb._id] = cb
 
     def callback_valid_names(self):
         """ Returns list of valid or current names that callbacks can be registered on."""
@@ -130,7 +154,7 @@ class CalvinCBClass(object):
         if self.__callback_valid_names is None or name in self.__callback_valid_names:
             if name not in self.__callbacks:
                 self.__callbacks[name] = {}
-            self.__callbacks[name][cb.id] = cb
+            self.__callbacks[name][cb._id] = cb
 
     def callback_unregister(self, _id):
         """ Unregisters a callback
@@ -165,7 +189,7 @@ class CalvinCBClass(object):
         local_copy = self.__callbacks[name].copy()
         for cb in local_copy.itervalues():
             try:
-                reply[cb.id] = cb(*args, **kwargs)
+                reply[cb._id] = cb(*args, **kwargs)
             except:
                 _log.exception("Callback '%s' failed on %s(%s, %s)" % (name, cb, args, kwargs))
         return reply
@@ -214,6 +238,6 @@ if __name__ == '__main__':
 
     t = TestingCB(1, callbacks={'test1': [a], 'test2': [b]})
     t.callback_register('test1', CalvinCB(fname2))
-    t.callback_unregister(a.id)
+    t.callback_unregister(a._id)
     print t.callback_valid_names()
     t.internal()

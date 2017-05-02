@@ -7,17 +7,16 @@ hygrometer : sensor.Humidity()
 humid_range : std.SetLimits(lower=40, upper=80)
 thermometer : sensor.Temperature()
 temp_range: std.SetLimits(lower=20, upper=33)
-alt : std.Alternate()
+alt : flow.Alternate2()
 pacer : std.ClassicDelay(delay=5)
 formatter: text.Format(fmt="{value}{unit}")
 display : io.Display()
 display_format : json.SetValue()
 set_background : json.SetValue()
-bgselect : std.Deselect()
+bgselect : flow.Deselect()
 alarm : std.Alarm()
 twit : web.Twitter()
-sel : std.Select()
-term : std.Terminator()
+sel : flow.Select()
 
 /* Connections */
 src.data > hygrometer.trigger
@@ -43,7 +42,7 @@ GREEN > bgselect.case_false
 alarm.warning > sel.select
 formatter.text > sel.data
 sel.case_true > twit.status
-sel.case_false > term.void
+sel.case_false > voidport
 
 bgselect.data > set_background.value
 "bgcolor" > set_background.key

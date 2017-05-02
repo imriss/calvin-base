@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 
 
 class MediaPlayer(Actor):
@@ -45,15 +45,10 @@ class MediaPlayer(Actor):
         self.player.close()
 
     @condition(['play'], [])
-    @guard(lambda _, play: play)
     def play(self, play):
-        self.player.play(self.media_file)
-        return ActionResult(production=())
+        if play:
+            self.player.play(self.media_file)
+        
 
-    @condition(['play'], [])
-    @guard(lambda _, play: not play)
-    def ignore(self, _):
-        return ActionResult(production=())
-
-    action_priority = (ignore, play, )
+    action_priority = (play, )
     requires =  ['calvinsys.media.mediaplayer']

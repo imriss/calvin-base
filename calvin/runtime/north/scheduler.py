@@ -16,8 +16,8 @@
 
 import sys
 import time
+import random
 
-from calvin.actor.actor import ActionResult
 from calvin.runtime.south.plugins.async import async
 from calvin.utilities.calvin_callback import CalvinCB
 from calvin.utilities.calvinlogger import get_logger
@@ -45,6 +45,7 @@ class Scheduler(object):
         self._heartbeat = 1
         self._maintenance_loop = None
         self._maintenance_delay = _conf.get(None, "maintenance_delay") or 300
+        self.actor_pressures = {}
 
     def run(self):
         async.run_ioloop()
@@ -61,30 +62,27 @@ class Scheduler(object):
             _log.exception("loop_once monitor failed")
             return
 
-        # If all ignore the set
-        if all_:
-            total = self.fire_actors(None)
-        else:
-            total = self.fire_actors(self._trigger_set)
+        actors_to_fire = None if all_ else self._trigger_set
+        did_fire, timeout, actor_ids = self.fire_actors(actors_to_fire)
 
         self._loop_once = None
 
         local_trigger_set = self._trigger_set
         self._trigger_set = set()
 
-        activity = total.did_fire or activity
-
-        _log.debug("looped_once for %s at %s again in %s" %
-                   ("ALL" if all_ else local_trigger_set, time.time(), 0 if activity else self._heartbeat))
+        activity = did_fire or activity or timeout
 
         if activity:
             # Something happened - run again
-            self.trigger_loop(0, total.actor_ids)
+            self.trigger_loop(0, actor_ids)
         else:
             # No firings, wait a while until next loop
             if self._heartbeat_loop is not None:
                 self._heartbeat_loop.cancel()
             self._heartbeat_loop = async.DelayedCall(self._heartbeat, self.trigger_loop)
+
+        # Control replication
+        self.node.rm.replication_loop()
 
     def trigger_loop(self, delay=0, actor_ids=None):
         """ Trigger the loop_once potentially after waiting delay seconds """
@@ -104,7 +102,6 @@ class Scheduler(object):
                     _log.debug("Ignoring fire")
                     return
 
-                _log.debug(self._trigger_set)
                 if self._loop_once is None:
                     self._loop_once = async.DelayedCall(0, self.loop_once)
 
@@ -112,27 +109,41 @@ class Scheduler(object):
         _log.exception(e)
 
     def fire_actors(self, actor_ids=None):
-        total = ActionResult(did_fire=False)
-        total.actor_ids = set()
+        did_fire = False
+        actor_ids = set()
 
-        for actor in self.actor_mgr.enabled_actors():
-            # if actor_ids is not None and actor.id not in actor_ids:
-            #     _log.debug("ignoring actor %s(%s)" % (actor._type, actor.id))
-            #     continue
+        actors = self.actor_mgr.enabled_actors()
+        # Shuffle order since now we stop after executing actors for too long
+        random.shuffle(actors)
+
+        start_time = time.time()
+        timeout = False
+        for actor in actors:
             try:
-                action_result = actor.fire()
-                _log.debug("fired actor %s(%s)" % (actor._type, actor.id))
-                total.merge(action_result)
-                total.actor_ids.add(actor.id)
+                _log.debug("Fire actor %s (%s, %s)" % (actor.name, actor._type, actor.id))
+                did_fire |= actor.fire()
+                actor_ids.add(actor.id)
             except Exception as e:
                 self._log_exception_during_fire(e)
-        self.idle = not total.did_fire
-        return total
+
+            pressure = actor.get_pressure().values()
+            pressure_values = [p for _, _, p in pressure]
+            if self.actor_pressures.get(actor.id, False) != pressure_values:
+                self.actor_pressures[actor.id] = pressure_values
+
+            timeout = time.time() - start_time > 0.100
+            if timeout:
+                break
+
+        # FIXME: self.idle = not (timeout or did_fire)
+        self.idle = False if timeout else not did_fire
+
+        return (did_fire, timeout, actor_ids)
 
     def maintenance_loop(self):
         # Migrate denied actors
         for actor in self.actor_mgr.migratable_actors():
-            self.actor_mgr.migrate(actor.id, actor.migration_info["node_id"], 
+            self.actor_mgr.migrate(actor.id, actor.migration_info["node_id"],
                                    callback=CalvinCB(actor.remove_migration_info))
         # Enable denied actors again if access is permitted. Will try to migrate if access still denied.
         for actor in self.actor_mgr.denied_actors():
@@ -158,12 +169,13 @@ class DebugScheduler(Scheduler):
         super(DebugScheduler, self).__init__(node, actor_mgr, monitor)
 
     def trigger_loop(self, delay=0, actor_ids=None):
-        import inspect
-        import traceback
+        #import inspect
+        #import traceback
         super(DebugScheduler, self).trigger_loop(delay, actor_ids)
-        (frame, filename, line_no, fname, lines, index) = inspect.getouterframes(inspect.currentframe())[1]
-        _log.debug("triggered %s by %s in file %s at %s" % (time.time(), fname, filename, line_no))
-        _log.debug("Trigger happend here:\n" + ''.join(traceback.format_stack()[-6:-1]))
+        #(frame, filename, line_no, fname, lines, index) = inspect.getouterframes(inspect.currentframe())[1]
+        #_log.debug("triggered %s by %s in file %s at %s" % (time.time(), fname, filename, line_no))
+        #_log.debug("Trigger happend here:\n" + ''.join(traceback.format_stack()[-6:-1]))
+        _log.analyze(self.node.id, "+ Triggered", None, tb=True)
 
     def _log_exception_during_fire(self, e):
         from infi.traceback import format_exception

@@ -101,6 +101,16 @@ function drawConnections()
     });
 };
 
+// Show dialog for setting requirements
+function showMessage(message)
+{
+    $("#show_message_body").html(message);
+    $("#messageDialog").modal({
+        modal: true,
+        show: true
+    });
+}
+
 function showAlert(message, type, delay)
 {
     var alert = $('<div class="alert alert-' + type + ' fade in">')
@@ -127,6 +137,11 @@ function showSuccess(message)
     showAlert(message, "success", 5000);
 }
 
+function showInfo(message)
+{
+    showAlert(message, "info", 5000);
+}
+
 function addActorToGraph(actor)
 {
     if (document.getElementById("chkDrawApplication").checked) {
@@ -150,6 +165,19 @@ function addActorToGraph(actor)
             graph.setNode(actor.id, {label: actor.name, style: 'fill: White'});
         }
         graph.setParent(actor.id, actor.peer_id);
+
+        graphTimer = setTimeout(updateGraph, 1000);
+    }
+}
+
+function removeActorFromGraph(actor)
+{
+    if (document.getElementById("chkDrawApplication").checked) {
+        if (graphTimer) {
+            clearTimeout(graphTimer);
+        }
+
+        graph.removeNode(actor.id);
 
         graphTimer = setTimeout(updateGraph, 1000);
     }
@@ -251,6 +279,16 @@ function findRuntime(id)
     }
 }
 
+function popRuntime(id)
+{
+    var index;
+    for (index in peers) {
+        if (peers[index].id == id) {
+            return peers.splice(index, 1)[0];
+        }
+    }
+}
+
 // Application object constructor function
 function applicationObject(id)
 {
@@ -284,6 +322,17 @@ function findActor(id)
     for (index in actors) {
         if (actors[index].id == id) {
             return actors[index];
+        }
+    }
+}
+
+// Return actor from id and remove it
+function popActor(id)
+{
+    var index;
+    for (index in actors) {
+        if (actors[index].id == id) {
+            return actors.splice(index, 1)[0];
         }
     }
 }
@@ -499,8 +548,8 @@ function getPeersFromIndex(index)
 // Get connected peers
 function getPeers(peer)
 {
-    if (peer.control_uri) {
-        var url = peer.control_uri + '/nodes';
+    if (peer.control_uris) {
+        var url = peer.control_uris[0] + '/nodes';
         console.log("getPeers - url: " + url);
         $.ajax({
             peer: peer,
@@ -566,8 +615,21 @@ function getPeer(id)
                     peer = new runtimeObject(id);
                     peers[peers.length] = peer;
                 }
-                peer.uri = data.uri;
-                peer.control_uri = data.control_uri;
+                if (data.uris) {
+                    peer.uris = data.uris;
+                } else {
+                    peer.uris = "";
+                }
+                if (data.control_uris) {
+                    peer.control_uris = data.control_uris;
+                } else {
+                    peer.control_uris = "";
+                }
+                if (data.proxy) {
+                    peer.proxy = data.proxy;
+                } else {
+                    peer.proxy = "";
+                }
                 peer.attributes = data.attributes;
                 if (peer.attributes.indexed_public) {
                     for (attribute in peer.attributes.indexed_public) {
@@ -630,7 +692,16 @@ function getPeer(id)
             }
         },
         error: function() {
-            showError("Failed to get peer, url: " + url);
+            // If we don't find the runtime in storage remove it
+            popRuntime(id)
+            var tableRef = document.getElementById('peersTable');
+            for (var x = 0; x < tableRef.rows.length; x++) {
+                if (tableRef.rows[x].cells[0].innerHTML == id) {
+                    tableRef.deleteRow(x);
+                    break;
+                }
+            }
+            showInfo("Ignore unfound peer, id: " + id);
         }
     });
 }
@@ -655,10 +726,10 @@ function getApplications()
     actors = [];
     var index;
     for (index in peers) {
-        if (peers[index].control_uri) {
-            url = peers[index].control_uri + '/applications';
+        if (peers[index].control_uris) {
+            url = peers[index].control_uris[0] + '/applications';
             $.ajax({
-                uri: peers[index].control_uri,
+                uri: peers[index].control_uris[0],
                 timeout: 20000,
                 beforeSend: function() {
                     startSpin();
@@ -681,6 +752,8 @@ function getApplications()
                     }
                 },
                 error: function() {
+                    // Remove the peer that we failed to contact
+                    popRuntime(peers[index].id)
                     console.log("Failed to get applications, url: " + url);
                 }
             });
@@ -738,7 +811,7 @@ function getApplication(uri, id)
 }
 
 // Get actor with id "id"
-function getActor(id, show)
+function getActor(id, show, replicas, retries)
 {
     var url = connect_uri + '/actor/' + id;
     console.log("getActor - url: " + url)
@@ -788,12 +861,56 @@ function getActor(id, show)
                     sortCombo(actorSelector);
                     addActorToGraph(actor);
                 }
+                if (replicas && "replication_master_id" in data && data.replication_master_id == actor.id) {
+                    actor.master = true
+                    actor.replication_id = data.replication_id
+                    getReplicas(data.replication_id)
+                } else {
+                    actor.master = false
+                }
             } else {
                 console.log("getActor - Empty response");
             }
         },
         error: function() {
             showError("Failed to get actor, url: " + url);
+            if (retries > 0) {
+                getActor(id, show, replicas, retries - 1)
+            }
+        }
+    });
+}
+
+// Get replicas for replication with id "id"
+function getReplicas(id)
+{
+    var url = connect_uri + '/index/replicas/actors/' + id;
+    console.log("getReplicas - url: " + url)
+    $.ajax({
+        timeout: 20000,
+        beforeSend: function() {
+            startSpin();
+        },
+        complete: function() {
+            stopSpin();
+        },
+        dataType: 'json',
+        url: url,
+        type: 'GET',
+        success: function(data) {
+            if (data) {
+                console.log("getReplicas - Response: " + JSON.stringify(data));
+                var index
+                for (index in data.result) {
+                    var actor_id = data.result[index]
+                    getActor(actor_id, false, false, 0)
+                }
+            } else {
+                console.log("getReplicas - Empty response");
+            }
+        },
+        error: function() {
+            showInfo("Failed to get replicas, url: " + url);
         }
     });
 }
@@ -850,8 +967,8 @@ function getPortState(port_id)
         var actor = findActor(port.actor_id);
         if (actor) {
             var runtime = findRuntime(actor.peer_id);
-            if (runtime && runtime.control_uri) {
-                var url = runtime.control_uri + '/actor/' + port.actor_id + '/port/' + port_id + "/state";
+            if (runtime && runtime.control_uris) {
+                var url = runtime.control_uris[0] + '/actor/' + port.actor_id + '/port/' + port_id + "/state";
                 console.log("getPort - url: " + url);
                 $.ajax({
                     timeout: 20000,
@@ -889,7 +1006,7 @@ function getPortState(port_id)
 }
 
 // Helper for adding a table row with elements
-function AddTableItem(tableRef, element1, element2, element3, element4, element5, element6, element7)
+function AddTableItem(tableRef, element1, element2, element3, element4, element5, element6, element7, element8, element9)
 {
     var row = tableRef.insertRow();
     if (element1) {
@@ -925,6 +1042,16 @@ function AddTableItem(tableRef, element1, element2, element3, element4, element5
     if (element7) {
         var cell = row.insertCell(6);
         cell.appendChild(element7);
+    }
+
+    if (element8) {
+        var cell = row.insertCell(7);
+        cell.appendChild(element8);
+    }
+
+    if (element9) {
+        var cell = row.insertCell(8);
+        cell.appendChild(element9);
     }
 
     return row;
@@ -1006,8 +1133,8 @@ function setRuntimeConfig()
     peer.owner.personOrGroup = update_attribute_from_input(peer.owner.personOrGroup, $("#conf_owner_personOrGroup"));
 
     var url;
-    if (peer.control_uri) {
-        url = peer.control_uri + '/node/' + peer.id + '/attributes/indexed_public';
+    if (peer.control_uris) {
+        url = peer.control_uris[0] + '/node/' + peer.id + '/attributes/indexed_public';
     } else {
         url = connect_uri + '/node/' + peer.id + '/attributes/indexed_public';
     }
@@ -1068,13 +1195,20 @@ function showPeer(peer)
     btnConfigure.value = 'Configure...';
     btnConfigure.setAttribute("onclick", "showRuntimeConfig(this.id)");
 
-    if (peer.control_uri) {
+    if (peer.control_uris) {
         var btnDestroy = document.createElement('input');
         btnDestroy.type = 'button';
         btnDestroy.className = "btn btn-danger btn-xs";
         btnDestroy.id = peer.id;
         btnDestroy.value = 'Destroy';
         btnDestroy.setAttribute("onclick", "destroyPeer(this.id)");
+
+        var btnAbolish = document.createElement('input');
+        btnAbolish.type = 'button';
+        btnAbolish.className = "btn btn-danger btn-xs";
+        btnAbolish.id = peer.id;
+        btnAbolish.value = 'Abolish';
+        btnAbolish.setAttribute("onclick", "destroyPeerByMethod(this.id, 'migrate')");
 
         var btnDeploy = document.createElement('input');
         btnDeploy.type = 'button';
@@ -1083,9 +1217,24 @@ function showPeer(peer)
         btnDeploy.value = 'Deploy...';
         btnDeploy.setAttribute("onclick", "showDeployApplication(this.id)");
 
-        row = AddTableItem(tableRef, document.createTextNode(peer.id), document.createTextNode(peer.node_name.name), document.createTextNode(peer.uri), document.createTextNode(peer.control_uri), btnConfigure, btnDestroy, btnDeploy);
+        row = AddTableItem(tableRef,
+            document.createTextNode(peer.id),
+            document.createTextNode(peer.node_name.name),
+            document.createTextNode(peer.uris),
+            document.createTextNode(peer.control_uris),
+            document.createTextNode(peer.proxy),
+            btnConfigure,
+            btnDestroy,
+            btnAbolish,
+            btnDeploy);
     } else {
-        row = AddTableItem(tableRef, document.createTextNode(peer.id), document.createTextNode(peer.node_name.name), document.createTextNode(peer.uri), document.createTextNode(peer.control_uri), btnConfigure);
+        row = AddTableItem(tableRef,
+            document.createTextNode(peer.id),
+            document.createTextNode(peer.node_name.name),
+            document.createTextNode(peer.uris),
+            document.createTextNode(peer.control_uris),
+            document.createTextNode(peer.proxy),
+            btnConfigure);
     }
 
     row.id = peer.id;
@@ -1137,7 +1286,7 @@ function showApplication()
 
         var index;
         for (index in application.actors) {
-            getActor(application.actors[index], false);
+            getActor(application.actors[index], false, true, 0);
         }
         startGraphEvents(application);
     }
@@ -1150,7 +1299,7 @@ function updateSelectedActor()
     var selectOptions = document.getElementById("actorSelector").options;
     var actorID = selectOptions[selectedIndex].id;
     if (actorID) {
-        getActor(actorID, true);
+        getActor(actorID, true, false, 0);
     }
 }
 
@@ -1195,6 +1344,11 @@ function showActor()
                 optionPeer.id = peers[index].id;
                 selectNode.options.add(optionPeer);
                 sortCombo(selectNode);
+            } else {
+                var optionPeer = new Option("Same");
+                optionPeer.id = peers[index].id;
+                selectNode.options.add(optionPeer);
+                sortCombo(selectNode);
             }
         }
         var btnMigrate = document.createElement('input');
@@ -1203,7 +1357,30 @@ function showActor()
         btnMigrate.id = actor.id;
         btnMigrate.value = 'Migrate';
         btnMigrate.setAttribute("onclick", "migrate(this.id)");
-        AddTableItem(tableRef, selectNode, btnMigrate);
+
+        // FIXME now during testing we have manual control over replication, this will be removed later
+        var btnReplicate = document.createElement('input');
+        btnReplicate.type = 'button';
+        btnReplicate.className = "btn btn-primary btn-xs";
+        btnReplicate.id = actor.id;
+        btnReplicate.value = 'Replicate';
+        btnReplicate.setAttribute("onclick", "replicate(this.id)");
+
+        // FIXME now during testing we have manual control over dereplication, this will be removed later
+        var btnDereplicate = document.createElement('input');
+        btnDereplicate.type = 'button';
+        btnDereplicate.className = "btn btn-primary btn-xs";
+        btnDereplicate.id = actor.id;
+        btnDereplicate.value = 'Dereplicate';
+        btnDereplicate.setAttribute("onclick", "dereplicate(this.id)");
+
+        var row = tableRef.insertRow();
+        var cell = row.insertCell(0);
+        cell.appendChild(selectNode);
+        var cell = row.insertCell(1);
+        cell.appendChild(btnMigrate);
+        cell.appendChild(btnReplicate);
+        cell.appendChild(btnDereplicate);
 
         // Add ports
         var portSelector = document.getElementById("portSelector");
@@ -1278,10 +1455,14 @@ function migrate(actor_id)
     var peer_id = combo.options[combo.selectedIndex].id;
     var actor = findActor(actor_id);
     if (actor) {
+        if (actor.peer_id == peer_id) {
+            showError("Can't migrate to same node");
+            return
+        }
         var node = findRuntime(actor.peer_id);
         if (node) {
-            if (node.control_uri) {
-                var url = node.control_uri + '/actor/' + actor.id + '/migrate';
+            if (node.control_uris) {
+                var url = node.control_uris[0] + '/actor/' + actor.id + '/migrate';
                 var data = JSON.stringify({'peer_node_id': peer_id});
                 console.log("migrate - url: " + url + " data: " + data);
                 $.ajax({
@@ -1296,7 +1477,7 @@ function migrate(actor_id)
                     type: 'POST',
                     data: data,
                     success: function() {
-                        getActor(actor_id, true);
+                        getActor(actor_id, true, false, 0);
                         showSuccess("Actor " + actor_id + " migrated");
                     },
                     error: function() {
@@ -1308,6 +1489,98 @@ function migrate(actor_id)
             }
         } else {
             showError("Failed to migrate, no node with id: " + actor.peer_id);
+        }
+    }
+}
+
+// Replicate actor with "actor_id" to selected (or unselected) runtime in combobox in actorsTable
+// FIXME now during testing we have manual control over replication, this will be removed later
+function replicate(actor_id)
+{
+    var combo = document.getElementById('selectRuntime');
+    try {
+        var peer_id = combo.options[combo.selectedIndex].id;
+    } catch(err) {
+        var peer_id = "same";
+    }
+    var actor = findActor(actor_id);
+    if (actor) {
+        var node = findRuntime(actor.peer_id);
+        if (node) {
+            if (node.control_uris) {
+                var url = node.control_uri[0] + '/actor/' + actor.id + '/replicate';
+                if (peer_id == "same") {
+                    var data = JSON.stringify({});
+                } else {
+                    var data = JSON.stringify({'peer_node_id': peer_id});
+                }
+                console.log("replicate - url: " + url + " data: " + data);
+                $.ajax({
+                    timeout: 5000,
+                    beforeSend: function() {
+                        startSpin();
+                    },
+                    complete: function() {
+                        stopSpin();
+                    },
+                    url: url,
+                    type: 'POST',
+                    data: data,
+                    success: function(data) {
+                        showSuccess("Actor " + actor.name +"("+ actor_id +")" + " replicated as " + data['actor_id']);
+                    },
+                    error: function() {
+                        showError("Failed to replicate " + actor.name +"("+ actor_id +")");
+                    }
+                });
+            } else {
+                showError("Node " + actor.peer_id + " has no control API");
+            }
+        } else {
+            showError("Failed to replicate, no node with id: " + actor.peer_id);
+        }
+    }
+}
+
+// Dereplicate actor with "actor_id"
+// FIXME now during testing we have manual control over replication, this will be removed later
+function dereplicate(actor_id)
+{
+    var actor = findActor(actor_id);
+    if (actor) {
+        var node = findRuntime(actor.peer_id);
+        if (node) {
+            if (node.control_uris) {
+                var url = node.control_uris[0] + '/actor/' + actor.id + '/replicate';
+                var data = JSON.stringify({'dereplicate': true, 'exhaust': true});
+                console.log("replicate - url: " + url + " data: " + data);
+                $.ajax({
+                    timeout: 30000,  // long timeout since it takes time to exhasut tokens if downstream is slow
+                    beforeSend: function() {
+                        startSpin();
+                    },
+                    complete: function() {
+                        stopSpin();
+                    },
+                    url: url,
+                    type: 'POST',
+                    data: data,
+                    success: function(data) {
+                        showSuccess("Actor " + actor.name +"("+ actor_id +")" + " dereplicated");
+                    },
+                    error: function(data, status) {
+                        if (status == "timeout") {
+                            showError("Timeout when dereplicated " + actor.name +"("+ actor_id +")");
+                        } else {
+                            showError("Failed to dereplicate " + actor.name +"("+ actor_id +")");
+                        }
+                    }
+                });
+            } else {
+                showError("Node " + actor.peer_id + " has no control API");
+            }
+        } else {
+            showError("Failed to dereplicate, no node with id: " + actor.peer_id);
         }
     }
 }
@@ -1345,14 +1618,16 @@ function destroyApplication(application_id)
 // Destroy runtime with id "peer_id"
 function destroyPeer(peer_id)
 {
+    return destroyPeerByMethod(peer_id, "now");
+}
+
+// Destroy runtime with id "peer_id"
+function destroyPeerByMethod(peer_id, method)
+{
     var peer = findRuntime(peer_id);
     if (peer) {
-        var url = peer.control_uri + '/node';
+        var url = peer.control_uris[0] + '/node/' + method;
         console.log("destroyPeer url: " + url);
-
-        if (peer.source != null) {
-            peer.source.removeEventListener("message", eventHandler, false);
-        }
 
         $.ajax({
             timeout: 20000,
@@ -1365,6 +1640,10 @@ function destroyPeer(peer_id)
             url: url,
             type: 'DELETE',
             success: function() {
+                if (peer.source != null) {
+                    peer.source.removeEventListener("message", eventHandler, false);
+                }
+                popRuntime(peer_id)
                 var tableRef = document.getElementById('peersTable');
                 for (var x = 0; x < tableRef.rows.length; x++) {
                     if (tableRef.rows[x].cells[0].innerHTML == peer_id) {
@@ -1375,6 +1654,9 @@ function destroyPeer(peer_id)
                 }
             },
             error: function() {
+                if (peer.source != null) {
+                    peer.source.removeEventListener("message", eventHandler, false);
+                }
                 showError("Failed to destroy runtime");
             }
         });
@@ -1445,6 +1727,12 @@ function startTrace() {
     if (document.getElementById("chkTraceActorMigrate").checked) {
         events.push("actor_migrate");
     }
+    if (document.getElementById("chkTraceActorReplicate").checked) {
+        events.push("actor_replicate");
+    }
+    if (document.getElementById("chkTraceActorDereplicate").checked) {
+        events.push("actor_dereplicate");
+    }
     if (document.getElementById("chkTraceApplicationNew").checked) {
         events.push("application_new");
     }
@@ -1457,14 +1745,17 @@ function startTrace() {
     if (document.getElementById("chkTraceLinkDisconnected").checked) {
         events.push("link_disconnected");
     }
+    if (document.getElementById("chkTraceLogMessage").checked) {
+        events.push("log_message");
+    }
 
     $("#traceDialog").modal('hide');
     for (var index in peers) {
-        if (peers[index].control_uri) {
+        if (peers[index].control_uris) {
             if (peers[index].source) {
-                showError("Trace already started on runtime" + peers[index].id);
+                showInfo("Trace already started on runtime" + peers[index].id);
             } else {
-                var url = peers[index].control_uri + '/log';
+                var url = peers[index].control_uris[0] + '/log';
                 var data = JSON.stringify({'actors': actors, 'events': events});
                 console.log("startLog - url: " + url + " data: " + data);
                 $.ajax({
@@ -1483,14 +1774,14 @@ function startTrace() {
                         if(data) {
                             console.log("startLog - data: " + JSON.stringify(data));
                             this.peer.user_id = data.user_id;
-                            this.peer.source = new EventSource(this.peer.control_uri + '/log/' + this.peer.user_id);
+                            this.peer.source = new EventSource(this.peer.control_uris[0] + '/log/' + this.peer.user_id);
                             this.peer.source.addEventListener("message", eventHandler, false);
                         } else {
                             console.log("startLog - Empty response");
                         }
                     },
                     error: function() {
-                        showError("Failed to start log, url: " + url);
+                        showInfo("Failed to start log, url: " + url);
                     }
                 });
             }
@@ -1502,7 +1793,7 @@ function startTrace() {
 function stopLog()
 {
     for (var index in peers) {
-        var url = peers[index].control_uri + '/log/' + peers[index].user_id;
+        var url = peers[index].control_uris[0] + '/log/' + peers[index].user_id;
         console.log("stopLog url: " + url);
         $.ajax({
             timeout: 20000,
@@ -1517,7 +1808,7 @@ function stopLog()
             success: function() {
             },
             error: function() {
-                showError("Failed to stop log, url: " + url);
+                showInfo("Failed to stop log, url: " + url);
             }
         });
         if (peers[index].source) {
@@ -1575,7 +1866,7 @@ function eventHandler(event)
             cell8.appendChild(document.createTextNode(data.action_result));
         }
     } else if(data.type == "actor_new") {
-        var actor = findActor(data.actor);
+        var actor = findActor(data.actor_id);
         if (!actor) {
             actor = new actorObject(data.actor);
             actors[actors.length] = actor;
@@ -1588,6 +1879,20 @@ function eventHandler(event)
         cell4.appendChild(document.createTextNode(actor.name));
         cell5.appendChild(document.createTextNode(actor.type));
         cell6.appendChild(document.createTextNode(actor.is_shadow));
+    } else if(data.type == "actor_replicate") {
+        cell3.appendChild(document.createTextNode(data.replica_actor_id));
+        cell5.appendChild(document.createTextNode(data.replication_id));
+        var actor = findActor(data.actor_id);
+        if (actor) {
+            cell4.appendChild(document.createTextNode(actor.name + " replica"));
+        }
+    } else if(data.type == "actor_dereplicate") {
+        cell3.appendChild(document.createTextNode(data.replica_actor_id));
+        cell5.appendChild(document.createTextNode(data.replication_id));
+        var actor = findActor(data.actor_id);
+        if (actor) {
+            cell4.appendChild(document.createTextNode(actor.name + " replica"));
+        }
     } else if(data.type == "actor_destroy") {
         var actor_name = "";
         var actor = findActor(data.actor_id);
@@ -1612,9 +1917,11 @@ function eventHandler(event)
         cell3.appendChild(document.createTextNode(data.application_id));
     } else if(data.type == "link_connected") {
         cell3.appendChild(document.createTextNode(data.peer_id));
-        cell4.appendChild(document.createTextNode(data.uri));
+        cell4.appendChild(document.createTextNode(data.uris));
     } else if(data.type == "link_disconnected") {
         cell3.appendChild(document.createTextNode(data.peer_id));
+    } else if(data.type == "log_message") {
+        cell3.appendChild(document.createTextNode(data.msg));
     } else {
         console.log("eventHandler - Unknown event type:" + data.type);
     }
@@ -1623,14 +1930,14 @@ function eventHandler(event)
 // Start event stream for graph
 function startGraphEvents(application)
 {
-    var events = ["actor_new"];
+    var events = ["actor_new", "actor_replicate", "actor_dereplicate"];
     var actors = application.actors;
     for (var index in peers) {
-        if (peers[index].control_uri) {
+        if (peers[index].control_uris) {
             if (peers[index].graph_source) {
                 showError("Graph trace already started on runtime" + peers[index].node_name.name);
             } else {
-                var url = peers[index].control_uri + '/log';
+                var url = peers[index].control_uris[0] + '/log';
                 var data = JSON.stringify({'actors': actors, 'events': events});
                 console.log("startGraphEvents - url: " + url + " data: " + data);
                 $.ajax({
@@ -1649,7 +1956,7 @@ function startGraphEvents(application)
                         if(data) {
                             console.log("startGraphEvents - data: " + JSON.stringify(data));
                             this.peer.graph_user_id = data.user_id;
-                            this.peer.graph_source = new EventSource(this.peer.control_uri + '/log/' + data.user_id);
+                            this.peer.graph_source = new EventSource(this.peer.control_uris[0] + '/log/' + data.user_id);
                             this.peer.graph_source.addEventListener("message", graphEventHandler, false);
                         } else {
                             console.log("startGraphEvents - Empty response");
@@ -1669,7 +1976,7 @@ function stopGraphEvents()
 {
     for (var index in peers) {
         if (peers[index].graph_source && peers[index].graph_user_id) {
-            var url = peers[index].control_uri + '/log/' + peers[index].graph_user_id;
+            var url = peers[index].control_uris[0] + '/log/' + peers[index].graph_user_id;
             console.log("stopGraphEvents url: " + url);
             $.ajax({
                 timeout: 5000,
@@ -1684,7 +1991,7 @@ function stopGraphEvents()
                 success: function() {
                 },
                 error: function() {
-                    showError("Failed to stop log, url: " + url);
+                    showInfo("Failed to stop log, url: " + url);
                 }
             });
 
@@ -1706,6 +2013,32 @@ function graphEventHandler(event)
             actor.peer_id = data.node_id;
             actor.is_shadow = data.is_shadow;
             addActorToGraph(actor);
+        }
+    } else if(data.type == "actor_replicate") {
+        var actor = findActor(data.actor_id);
+        if (actor) {
+            actor.master = true
+            actor.replication_id = data.replication_id
+        }
+        if (!findRuntime(data.dest_node_id)) {
+            getPeer(data.dest_node_id);
+        }
+        getActor(data.replica_actor_id, false, false, 1);
+    } else if(data.type == "actor_dereplicate") {
+        var actor = popActor(data.replica_actor_id);
+        console.log("Dereplicated - " + actor);
+        if (actor) {
+            console.log("Dereplicated - found " + actor.id);
+            removeActorFromGraph(actor);
+            var actorSelector = document.getElementById("actorSelector");
+            var index;
+            for (index in actorSelector.options) {
+                if (actorSelector.options[index].id == actor.id) {
+                    break;
+                }
+            }
+            actorSelector.options.remove(index);
+            sortCombo(actorSelector);
         }
     } else {
         console.log("graphEventHandler - Unknown event type:" + data.type);
@@ -1731,20 +2064,26 @@ function deployHandler()
     var script = $("#deploy_script").val();
     var name = $("#script_name").val();
     var reqs = $("#migrate_reqs").val();
-    deployApplication(peer.control_uri, script, reqs, name);
+    var creds = $("#credentials_conf").val();
+    deployApplication(peer.control_uris[0], script, reqs, name, creds);
 }
 
 // Deploy application with "script" and "name" to runtime with "uri"
-function deployApplication(uri, script, reqs, name)
+function deployApplication(uri, script, reqs, name, creds)
 {
     var url = uri + '/deploy';
-    var data;
+    var tmp = {'script': script, 'name': name};
+
     if (reqs) {
-        var requirements = JSON.parse(reqs);
-        data = JSON.stringify({'script': script, 'deploy_info': requirements, 'name': name});
-    } else {
-        data = JSON.stringify({'script': script, 'name': name});
+        tmp.deploy_info = JSON.parse(reqs);
     }
+
+    if (creds) {
+        tmp.sec_credentials = JSON.parse(creds);
+    }
+
+    var data = JSON.stringify(tmp);
+
     console.log("deployApplication url: " + url + " data: " + data);
     $.ajax({
         timeout: 20000,
@@ -1760,8 +2099,21 @@ function deployApplication(uri, script, reqs, name)
         success: function(data) {
             showSuccess("Application " + name + " deployed");
         },
-        error: function() {
-            showError("Failed to deploy application, url: " + url + " data: " + data);
+        error: function(data, status) {
+            data = JSON.parse(data.responseText)
+            var index;
+            var msg = "";
+            for (index in data.errors) {
+                msg = msg + "Error Line: " + data.errors[index].line + " Col: " + data.errors[index].col;
+                msg = msg + " " + data.errors[index].reason + "<br>";
+            }
+            for (index in data.warnings) {
+                msg = msg + "Warning Line: " + data.warnings[index].line + " Col: " + data.warnings[index].col;
+                msg = msg + " " + data.warnings[index].reason + "<br>";
+            }
+            showError("Failed to deploy application: " + name);
+            console.log(msg);
+            showMessage(msg);
         }
     });
 }
@@ -1881,6 +2233,21 @@ jQuery(document).ready(function() {
         reader.readAsText(file);
     });
 
+    // handle file select in credentials
+    var fileInputCredentials = document.getElementById('fileInputCredentials');
+    var fileDisplayCredentials = document.getElementById('credentials_conf');
+    fileInputCredentials.addEventListener('change', function(e) {
+        var file = fileInputCredentials.files[0];
+        var reader = new FileReader();
+
+        reader.onload = function(e) {
+            console.log(e.target.result);
+            fileDisplayCredentials.innerHTML = e.target.result;
+        }
+
+        reader.readAsText(file);
+    });
+
     // handle file select in set requirements
     var fileInputRequirements = document.getElementById('fileInputRequirements');
     var fileDisplayRequirements = document.getElementById('requirements');
@@ -1901,6 +2268,11 @@ jQuery(document).ready(function() {
     })
 
     $('#tabRuntimeConfig a').click(function (e) {
+        e.preventDefault();
+        $(this).tab('show');
+    })
+
+    $('#tabDeployApplication a').click(function (e) {
         e.preventDefault();
         $(this).tab('show');
     })

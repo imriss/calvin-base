@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 from calvin.runtime.north.calvin_token import EOSToken
 
 
@@ -36,20 +36,20 @@ class Sequencer(Actor):
     @condition(action_input=['data_in'])
     def incoming(self, token):
         self.token = token
-        return ActionResult()
+        
 
+    @stateguard(lambda self: self.token is not None)
     @condition(action_output=['data_out'])
-    @guard(lambda self: self.token is not None)
     def send_token(self):
         token = self.token
         self.token = None
         self.eos = True
-        return ActionResult(production=(token,))
+        return (token,)
 
+    @stateguard(lambda self: self.eos)
     @condition(action_output=['data_out'])
-    @guard(lambda self: self.eos)
     def send_eos(self):
         self.eos = False
-        return ActionResult(production=(EOSToken(),))
+        return (EOSToken(),)
 
     action_priority = (incoming, send_token, send_eos)

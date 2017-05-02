@@ -16,7 +16,7 @@
 
 # encoding: utf-8
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition
+from calvin.actor.actor import Actor, manage, condition
 
 
 class BasicAuthHeader(Actor):
@@ -43,7 +43,7 @@ class BasicAuthHeader(Actor):
     def authorization_header(self, credential):
         auth = "Basic " + self['base64'].b64encode("%s:%s" % (credential['username'], credential['password']))
         header = {'Authorization': auth}
-        return ActionResult(production=(header,))
+        return (header,)
 
     action_priority = (authorization_header,)
     requires = ['calvinsys.native.python-base64']

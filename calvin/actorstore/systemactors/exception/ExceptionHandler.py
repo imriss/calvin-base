@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 from calvin.runtime.north.calvin_token import EOSToken, ExceptionToken
 
 
@@ -35,14 +35,13 @@ class ExceptionHandler(Actor):
       status : reason for any exception tokens encountered (including EOS)
     """
 
-    def exception_handler(self, action, args, context):
+    def exception_handler(self, action, args):
         try:
-            e = args[context['exceptions']['token'][0]]
+            e = args[0]
         except:
             e = ExceptionToken()
         self.status = e
         self.token = EOSToken()
-        return ActionResult()
 
     @manage(['status', 'token', 'replace', 'replacement'])
     def init(self, replace=False, replacement=None):
@@ -51,28 +50,28 @@ class ExceptionHandler(Actor):
         self.status = None
         self.token = None
 
+    @stateguard(lambda self: self.token is not None and self.status)
     @condition([], ['token', 'status'])
-    @guard(lambda self: self.token and self.status)
     def produce_with_exception(self):
         tok = self.replacement if self.replace else self.token
         status = self.status
         self.token = None
         self.status = None
-        return ActionResult(production=(tok, status.value))
+        return (tok, status.value)
 
+    @stateguard(lambda self: self.token is not None and not self.status)
     @condition([], ['token'])
-    @guard(lambda self: self.token and not self.status)
     def produce(self):
         tok = self.token
         self.token = None
-        return ActionResult(production=(tok,))
+        return (tok,)
 
+    @stateguard(lambda self: not self.status and self.token is None)
     @condition(['token'])
-    @guard(lambda self, tok: not self.status)
     def consume(self, tok):
         self.token = tok
         self.status = None
-        return ActionResult()
+
 
     action_priority = (produce_with_exception, produce, consume)
 
@@ -88,6 +87,11 @@ class ExceptionHandler(Actor):
         {  # Exception
             'in': {'token': EOSToken()},
             'out': {'token': ['End of stream'], 'status':['End of stream']}
+        },
+        {  # Long list with Exceptions in middle
+            'setup': [lambda self: self.init(replace=True, replacement="EOS")],
+            'in': {'token': [0, 1, 2, EOSToken(), 0, 1, 2, EOSToken(), 0, 1, 2]},
+            'out': {'token': [0, 1, 2, 'EOS', 0, 1, 2, 'EOS', 0, 1, 2], 'status':['End of stream', 'End of stream']}
         },
         {  # Exception with replace (default)
             'setup': [lambda self: self.init(replace=True)],

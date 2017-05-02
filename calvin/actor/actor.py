@@ -23,10 +23,14 @@ from calvin.actor import actorport
 from calvin.utilities.calvinlogger import get_logger
 from calvin.utilities.utils import enum
 from calvin.runtime.north.calvin_token import Token, ExceptionToken
-from calvin.runtime.north import calvincontrol
-from calvin.runtime.north import metering
+# from calvin.runtime.north import calvincontrol
+# from calvin.runtime.north import metering
+from calvin.runtime.north.replicationmanager import ReplicationData
+import calvin.requests.calvinresponse as response
+from calvin.runtime.south.plugins.async import async
 from calvin.runtime.north.plugins.authorization_checks import check_authorization_plugin_list
 from calvin.utilities.calvin_callback import CalvinCB
+from calvin.csparser.port_property_syntax import get_port_property_capabilities, get_port_property_runtime
 
 _log = get_logger(__name__)
 
@@ -75,25 +79,12 @@ def manage(include=None, exclude=None):
 def condition(action_input=[], action_output=[]):
     """
     Decorator condition specifies the required input data and output space.
-    Both parameters are lists of tuples: (port, #tokens consumed/produced)
-    Optionally, the port spec can be a port only, meaning #tokens is 1.
-    Return value is an ActionResult object
-
-    FIXME:
-    - Modify ActionResult to specify how many tokens were read/written from/to each port
-      E.g. ActionResult.tokens_consumed/produced are dicts: {'port1':4, 'port2':1, ...}
-      Since reading is done in the wrapper, tokens_consumed is fixed and given by action_input.
-      The action fills in tokens_produced and the wrapper uses that info when writing to ports.
-    - We can keep the @condition syntax by making the change in the normalize step below.
+    Both parameters are lists of port names
+    Return value is a tuple (did_fire, output_available, exhaust_list)
     """
-    #
-    # Normalize argument list (fill in a default repeat of 1 if not stated)
-    #
-    action_input = [p if isinstance(p, (list, tuple)) else (p, 1) for p in action_input]
-    action_output = [p if isinstance(p, (list, tuple)) else (p, 1) for p in action_output]
-    contract_output = tuple(n for _, n in action_output)
-    tokens_produced = sum(contract_output)
-    tokens_consumed = sum([n for _, n in action_input])
+
+    tokens_produced = len(action_output)
+    tokens_consumed = len(action_input)
 
     def wrap(action_method):
 
@@ -102,91 +93,64 @@ def condition(action_input=[], action_output=[]):
             #
             # Check if input ports have enough tokens. Note that all([]) evaluates to True
             #
-            input_ok = all(
-                [self.inports[portname].tokens_available(repeat) for (portname, repeat) in action_input]
-            )
+            input_ok = all(self.inports[portname].tokens_available(1) for portname in action_input)
             #
             # Check if output port have enough free token slots
             #
-            output_ok = all(
-                [self.outports[portname].tokens_available(repeat) for (portname, repeat) in action_output]
-            )
+            output_ok = all(self.outports[portname].tokens_available(1) for portname in action_output)
 
             if not input_ok or not output_ok:
-                _log.debug("%s.%s not runnable (%s, %s)" % (self.name, action_method.__name__, input_ok, output_ok))
-                return ActionResult(did_fire=False)
+                return (False, output_ok, ())
             #
             # Build the arguments for the action from the input port(s)
             #
+            exhausted_ports = set()
+            exception = False
             args = []
-            ex = {}
-            for (portname, repeat) in action_input:
+            for portname in action_input:
                 port = self.inports[portname]
-                tokenlist = []
-                for i in range(repeat):
-                    token = port.peek_token()
-                    is_exception = isinstance(token, ExceptionToken)
-                    if is_exception:
-                        ex.setdefault(portname, []).append(i)
-                    tokenlist.append(token if is_exception else token.value)
-                args.append(tokenlist if len(tokenlist) > 1 else tokenlist[0])
-
+                token, exhaust = port.read()
+                is_exception_token = isinstance(token, ExceptionToken)
+                exception = exception or is_exception_token
+                args.append(token if is_exception_token else token.value )
+                if exhaust:
+                   exhausted_ports.add(port)
             #
             # Check for exceptional conditions
             #
-            if ex:
-                action_result = self.exception_handler(action_method, args, {'exceptions': ex})
+            if exception:
+                # FIXME: Simplify exception handling
+                production = self.exception_handler(action_method, args) or ()
             else:
                 #
-                # Perform the action (N.B. the method may be wrapped in a guard)
+                # Perform the action (N.B. the method may be wrapped in a decorator)
+                # Action methods not returning a production (i.e. no output ports) returns None
+                # => replace with empty_production constant
                 #
-                action_result = action_method(self, *args)
+                production = action_method(self, *args) or ()
 
-            valid_production = False
-            if action_result.did_fire and (len(contract_output) == len(action_result.production)):
-                valid_production = True
-                for repeat, prod in zip(contract_output, action_result.production):
-                    if repeat > 1 and len(prod) != repeat:
-                        valid_production = False
-                        break
+            valid_production = (tokens_produced == len(production))
 
-            if action_result.did_fire and valid_production:
+            if not valid_production:
                 #
-                # Commit to the read from the FIFOs
+                # Error condition
                 #
-                for (portname, _) in action_input:
-                    self.inports[portname].peek_commit()
-                #
-                # Write the results from the action to the output port(s)
-                #
-                for (portname, repeat), retval in zip(action_output, action_result.production):
-                    port = self.outports[portname]
-                    for data in retval if repeat > 1 else [retval]:
-                        port.write_token(data if isinstance(data, Token) else Token(data))
-                #
-                # Bookkeeping
-                #
-                action_result.tokens_consumed = tokens_consumed
-                action_result.tokens_produced = tokens_produced
-            else:
-                #
-                # cancel the read from the FIFOs
-                #
-                for (portname, _) in action_input:
-                    self.inports[portname].peek_cancel()
-
-            if action_result.did_fire and not valid_production:
                 action = "%s.%s" % (self._type, action_method.__name__)
-                raise Exception("%s invalid production %s, expected %s" % (action, str(action_result.production), str(tuple(action_output))))
+                raise Exception("%s invalid production %s, expected %s" % (action, str(production), str(tuple(action_output))))
+            #
+            # Write the results from the action to the output port(s)
+            #
+            for portname, retval in zip(action_output, production):
+                port = self.outports[portname]
+                port.write_token(retval if isinstance(retval, Token) else Token(retval))
 
-            return action_result
-        condition_wrapper.action_input = action_input
-        condition_wrapper.action_output = action_output
+            return (True, True, exhausted_ports)
+
         return condition_wrapper
     return wrap
 
 
-def guard(action_guard):
+def stateguard(action_guard):
     """
     Decorator guard refines the criteria for picking an action to run by stating a function
     with THE SAME signature as the guarded action returning a boolean (True if action allowed).
@@ -198,12 +162,9 @@ def guard(action_guard):
 
         @functools.wraps(action_method)
         def guard_wrapper(self, *args):
-            retval = ActionResult(did_fire=False)
-            guard_ok = action_guard(self, *args)
-            _log.debug("%s.%s guard returned %s" % (self.name, action_method.__name__, guard_ok))
-            if guard_ok:
-                retval = action_method(self, *args)
-            return retval
+            if not action_guard(self):
+                return (False, True, ())
+            return action_method(self, *args)
 
         return guard_wrapper
     return wrap
@@ -227,34 +188,6 @@ def verify_status(valid_status_list, raise_=False):
         x = wrapped(*args, **kwargs)
         return x
     return wrapper
-
-
-class ActionResult(object):
-
-    """Return type from action and @guard"""
-
-    def __init__(self, did_fire=True, production=()):
-        super(ActionResult, self).__init__()
-        self.did_fire = did_fire
-        self.tokens_consumed = 0
-        self.tokens_produced = 0
-        self.production = production
-
-    def __str__(self):
-        fmtstr = "%s - did_fire:%s, consumed:%d, produced:%d"
-        return fmtstr % (self.__class__.__name__, str(self.did_fire), self.tokens_consumed, self.tokens_produced)
-
-    def merge(self, other_result):
-        """
-        Update this ActionResult by mergin data from other_result:
-             did_fire will be OR:ed together
-             any tokens_consumed will be ADDED
-             any tokens_produced will be ADDED
-             production will be DISCARDED
-        """
-        self.did_fire |= other_result.did_fire
-        self.tokens_consumed += other_result.tokens_consumed
-        self.tokens_produced += other_result.tokens_produced
 
 
 def _implements_state(obj):
@@ -328,42 +261,62 @@ class Actor(object):
     test_args = ()
     test_kwargs = {}
 
+    @property
+    def id(self):
+        return self._id
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        self._name = value
+
+    @property
+    def migration_info(self):
+        return self._migration_info
+
     # What are the arguments, really?
     def __init__(self, actor_type, name='', allow_invalid_transitions=True, disable_transition_checks=False,
                  disable_state_checks=False, actor_id=None, security=None):
         """Should _not_ be overridden in subclasses."""
         super(Actor, self).__init__()
         self._type = actor_type
-        self.name = name  # optional: human_readable_name
-        self.id = actor_id or calvinuuid.uuid("ACTOR")
-        _log.debug("New actor id: %s, supplied actor id %s" % (self.id, actor_id))
+        self._name = name  # optional: human_readable_name
+        self._id = actor_id or calvinuuid.uuid("ACTOR")
+        _log.debug("New actor id: %s, supplied actor id %s" % (self._id, actor_id))
         self._deployment_requirements = []
+        self._port_property_capabilities = None
         self._signature = None
-        self._component_members = set([self.id])  # We are only part of component if this is extended
-        self._managed = set(('id', 'name', '_deployment_requirements', '_signature', 'subject_attributes', 'migration_info'))
+        self._component_members = set([self._id])  # We are only part of component if this is extended
+        self._managed = set(('_id', '_name', '_has_started', '_deployment_requirements', '_signature', '_subject_attributes', '_migration_info', "_port_property_capabilities", "_replication_data"))
+        self._has_started = False
         self._calvinsys = None
         self._using = {}
-        self.control = calvincontrol.get_calvincontrol()
-        self.metering = metering.get_metering()
-        self.migration_info = None
+        # self.control = calvincontrol.get_calvincontrol()
+        # self.metering = metering.get_metering()
+        self._migration_info = None
         self._migrating_to = None  # During migration while on the previous node set to the next node id
         self._last_time_warning = 0.0
         self.sec = security
-        self.subject_attributes = self.sec.get_subject_attributes() if self.sec is not None else None
+        self._subject_attributes = self.sec.get_subject_attributes() if self.sec is not None else None
         self.authorization_checks = None
+        self._replication_data = ReplicationData(initialize=False)
+        self._exhaust_cb = None
 
-        self.inports = {p: actorport.InPort(p, self) for p in self.inport_names}
-        self.outports = {p: actorport.OutPort(p, self) for p in self.outport_names}
+        self.inports = {p: actorport.InPort(p, self, pp) for p, pp in self.inport_properties.items()}
+        self.outports = {p: actorport.OutPort(p, self, pp) for p, pp in self.outport_properties.items()}
 
         hooks = {
-            (Actor.STATUS.PENDING, Actor.STATUS.ENABLED): self.will_start,
+            (Actor.STATUS.PENDING, Actor.STATUS.ENABLED): self._will_start,
             (Actor.STATUS.ENABLED, Actor.STATUS.PENDING): self.will_stop,
         }
         self.fsm = Actor.FSM(Actor.STATUS, Actor.STATUS.LOADED, Actor.VALID_TRANSITIONS, hooks,
                              allow_invalid_transitions=allow_invalid_transitions,
                              disable_transition_checks=disable_transition_checks,
                              disable_state_checks=disable_state_checks)
-        self.metering.add_actor_info(self)
+        # self.metering.add_actor_info(self)
 
     def set_authorization_checks(self, authorization_checks):
         self.authorization_checks = authorization_checks
@@ -375,6 +328,12 @@ class Actor(object):
     def init(self):
         raise Exception("Implementing 'init()' is mandatory.")
 
+    def _will_start(self):
+        """Ensure will_start() is only called once"""
+        if not self._has_started:
+            self.will_start()
+            self._has_started = True
+        
     def will_start(self):
         """Override in actor subclass if actions need to be taken before starting."""
         pass
@@ -395,6 +354,10 @@ class Actor(object):
         """Override in actor subclass if actions need to be taken before destruction."""
         pass
 
+    def will_replicate(self, state):
+        """Override in actor subclass if actions need to be taken before replication."""
+        pass
+
     def __getitem__(self, attr):
         if attr in self._using:
             return self._using[attr]
@@ -411,13 +374,16 @@ class Actor(object):
         for p in self.outports.values():
             op = op + str(p)
         s = "Actor: '%s' class '%s'\nstatus: %s\ninports: %s\noutports:%s" % (
-            self.name, self._type, self.fsm, ip, op)
+            self._name, self._type, self.fsm, ip, op)
         return s
 
-    @verify_status([STATUS.READY, STATUS.PENDING])
+    @verify_status([STATUS.READY, STATUS.PENDING, STATUS.ENABLED])
     def did_connect(self, port):
         """Called when a port is connected, checks actor is fully connected."""
-        _log.debug("actor.did_connect BEGIN %s %s " % (self.name, self.id))
+        if self.fsm.state() == Actor.STATUS.ENABLED:
+            # We already was enabled thats fine now with dynamic port connections
+            return
+        _log.debug("actor.did_connect BEGIN %s %s " % (self._name, self._id))
         # If we happen to be in READY, go to PENDING
         if self.fsm.state() == Actor.STATUS.READY:
             self.fsm.transition_to(Actor.STATUS.PENDING)
@@ -436,7 +402,7 @@ class Actor(object):
 
         # If we made it here, all ports are connected
         self.fsm.transition_to(Actor.STATUS.ENABLED)
-        _log.debug("actor.did_connect ENABLED %s %s " % (self.name, self.id))
+        _log.debug("actor.did_connect ENABLED %s %s " % (self._name, self._id))
 
         # Actor enabled, inform scheduler
         self._calvinsys.scheduler_wakeup()
@@ -445,6 +411,7 @@ class Actor(object):
     def did_disconnect(self, port):
         """Called when a port is disconnected, checks actor is fully disconnected."""
         # If the actor is MIGRATABLE, return since it will be migrated soon.
+        _log.debug("Actor %s did_disconnect %s" % (self._id, Actor.STATUS.reverse_mapping[self.fsm.state()]))
         if self.fsm.state() == Actor.STATUS.MIGRATABLE:
             return
         # If we happen to be in ENABLED/DENIED, go to PENDING
@@ -466,54 +433,118 @@ class Actor(object):
         # If we made it here, all ports are disconnected
         self.fsm.transition_to(Actor.STATUS.READY)
 
+    def exhaust(self, callback):
+        self._exhaust_cb = callback
+
+    def get_pressure(self):
+        pressure = {}
+        for port in self.inports.values():
+            for e in port.endpoints:
+                PRESSURE_LENGTH = len(e.pressure)
+                pressure[(port.id, e.peer_id)] = (
+                    e.pressure_last, e.pressure_count, [e.pressure[t % PRESSURE_LENGTH] for t in range(
+                                        max(0, e.pressure_count - PRESSURE_LENGTH), e.pressure_count)])
+        return pressure
+
+    #
+    # FIXME: The following methods (_authorized, _warn_slow_actor, _handle_exhaustion) were
+    #        extracted from fire() to make the logic easier to follow
+    #
+    def _authorized(self):
+        authorized = self.check_authorization_decision()
+        if not authorized:
+            _log.info("Access denied for actor %s(%s)" % ( self._type, self._id))
+            # The authorization decision is not valid anymore.
+            # Change actor status to DENIED.
+            self.fsm.transition_to(Actor.STATUS.DENIED)
+            # Try to migrate actor.
+            self.sec.authorization_runtime_search(self._id, self._signature, callback=CalvinCB(self.set_migration_info))
+        return authorized
+
+    def _warn_slow_actor(self, time_spent, start_time):
+        time_since_warning = start_time - self._last_time_warning
+        if time_since_warning < 120.0:
+            return
+        self._last_time_warning = start_time
+        _log.warning("%s (%s) actor blocked for %f sec" % (self._name, self._type, time_spent))
+
+    def _handle_exhaustion(self, exhausted_ports, output_ok):
+        _log.debug("actor_fire %s test exhaust %s, %s, %s" % (self._id, self._exhaust_cb is not None, exhausted_ports, output_ok))
+        for port in exhausted_ports:
+            # Might result in actor changing to PENDING
+            try:
+                port.finished_exhaustion()
+            except:
+                _log.exception("FINSIHED EXHAUSTION FAILED")
+        if (output_ok and self._exhaust_cb is not None and
+            not any([p.any_outstanding_exhaustion_tokens() for p in self.inports.values()])):
+            _log.debug("actor %s exhausted" % self._id)
+            # We are in exhaustion, got all exhaustion tokens from peer ports
+            # but stopped firing while outport token slots available, i.e. exhausted inports or deadlock
+            # FIXME handle exhaustion deadlock
+            # Initiate disconnect of outports and destroy the actor
+            async.DelayedCall(0, self._exhaust_cb, status=response.CalvinResponse(True))
+            self._exhaust_cb = None
+
     @verify_status([STATUS.ENABLED])
     def fire(self):
+        """
+        Fire an actor.
+        Returns True if any action fired
+        """
+        # FIXME: Move authorization decision to scheduler
+        #
+        # First make sure we are allowed to run
+        #
+        if not self._authorized():
+            return False
+
         start_time = time.time()
-        total_result = ActionResult(did_fire=False)
-        while True:
-            if not self.check_authorization_decision():
-                _log.info("Access denied for actor %s(%s)" % ( self._type, self.id))
-                # The authorization decision is not valid anymore.
-                # Change actor status to DENIED.
-                self.fsm.transition_to(Actor.STATUS.DENIED)
-                # Try to migrate actor.
-                self.sec.authorization_runtime_search(self.id, self._signature, callback=CalvinCB(self.set_migration_info))
-                return total_result
-            # Re-try action in list order after EVERY firing
+        actor_did_fire = False
+        #
+        # Repeatedly go over the action priority list
+        #
+        done = False
+        while not done:
             for action_method in self.__class__.action_priority:
-                action_result = action_method(self)
-                total_result.merge(action_result)
+                did_fire, output_ok, exhausted = action_method(self)
+                actor_did_fire |= did_fire
                 # Action firing should fire the first action that can fire,
-                # hence when fired start from the beginning
-                if action_result.did_fire:
-                    # FIXME: Make this a hook for the runtime to use, don't
-                    #        import and use calvin_control or metering in actor
-                    self.metering.fired(self.id, action_method.__name__)
-                    self.control.log_actor_firing(
-                        self.id,
-                        action_method.__name__,
-                        action_result.tokens_produced,
-                        action_result.tokens_consumed,
-                        action_result.production)
-                    _log.debug("Actor %s(%s) did fire %s -> %s" % (
-                        self._type, self.id,
-                        action_method.__name__,
-                        str(action_result)))
+                # hence when fired start from the beginning priority list
+                if did_fire:
+                    # # FIXME: Add hooks for metering and probing
+                    # self.metering.fired(self._id, action_method.__name__)
+                    # self.control.log_actor_firing( ... )
                     break
 
-            if not action_result.did_fire:
-                diff = time.time() - start_time
-                if diff > 0.2 and start_time - self._last_time_warning > 120.0:
-                    # Every other minute warn if an actor runs for longer than 200 ms
-                    self._last_time_warning = start_time
-                    _log.warning("%s (%s) actor blocked for %f sec" % (self.name, self._type, diff))
-                # We reached the end of the list without ANY firing => return
-                return total_result
-        # Redundant as of now, kept as reminder for when rewriting exception handling.
-        raise Exception('Exit from fire should ALWAYS be from previous line.')
+            #
+            # We end up here when an action fired or when all actions have failed to fire
+            #
+            if did_fire:
+                #
+                # Limit time given to actors even if it could continue a new round of firing
+                #
+                # FIXME: IMHO this decision should be made in the scheduler. No timing here.
+                time_spent = time.time() - start_time
+                done = time_spent > 0.020
+            else:
+                #
+                # We reached the end of the list without ANY firing during this round
+                # => handle exhaustion and return
+                #
+                # FIXME: Move exhaust handling to scheduler
+                self._handle_exhaustion(exhausted, output_ok)
+                done = True
+
+        return actor_did_fire
+
 
     def enabled(self):
-        return self.fsm.state() == Actor.STATUS.ENABLED
+        # We want to run even if not fully connected during exhaustion
+        r = self.fsm.state() == Actor.STATUS.ENABLED or self._exhaust_cb is not None
+        if not r:
+            _log.debug("Actor %s %s not enabled" % (self._name, self._id))
+        return r
 
     def denied(self):
         return self.fsm.state() == Actor.STATUS.DENIED
@@ -528,7 +559,7 @@ class Actor(object):
             self.fsm.transition_to(Actor.STATUS.ENABLED)
         else:
             # Try to migrate actor.
-            self.sec.authorization_runtime_search(self.id, self._signature, callback=CalvinCB(self.set_migration_info))
+            self.sec.authorization_runtime_search(self._id, self._signature, callback=CalvinCB(self.set_migration_info))
 
     # DEPRECATED: Only here for backwards compatibility
     @verify_status([STATUS.ENABLED])
@@ -540,23 +571,26 @@ class Actor(object):
     def disable(self):
         self.fsm.transition_to(Actor.STATUS.PENDING)
 
-    @verify_status([STATUS.LOADED, STATUS.READY, STATUS.PENDING, STATUS.MIGRATABLE])
-    def state(self):
+    @verify_status([STATUS.LOADED, STATUS.READY, STATUS.PENDING, STATUS.ENABLED, STATUS.MIGRATABLE])
+    def state(self, remap=None):
         state = {}
         # Manual state handling
         # Not available until after __init__ completes
         state['_managed'] = list(self._managed)
-        state['inports'] = {port: self.inports[port]._state()
-                            for port in self.inports}
+        state['inports'] = {
+            port: self.inports[port]._state(remap=remap) for port in self.inports}
         state['outports'] = {
-            port: self.outports[port]._state() for port in self.outports}
+            port: self.outports[port]._state(remap=remap) for port in self.outports}
         state['_component_members'] = list(self._component_members)
 
         # Managed state handling
         for key in self._managed:
             obj = self.__dict__[key]
             if _implements_state(obj):
-                state[key] = obj.state()
+                try:
+                    state[key] = obj.state(remap)
+                except:
+                    state[key] = obj.state()
             else:
                 state[key] = obj
 
@@ -593,7 +627,7 @@ class Actor(object):
     # TODO verify status should only allow reading connections when and after being fully connected (enabled)
     @verify_status([STATUS.ENABLED, STATUS.READY, STATUS.PENDING, STATUS.MIGRATABLE])
     def connections(self, node_id):
-        c = {'actor_id': self.id, 'actor_name': self.name}
+        c = {'actor_id': self._id, 'actor_name': self._name}
         inports = {}
         for port in self.inports.values():
             peers = [
@@ -614,10 +648,10 @@ class Actor(object):
     def deserialize(self, data):
         self._set_state(data)
 
-    def exception_handler(self, action, args, context):
+    def exception_handler(self, action, args):
         """Defult handler when encountering ExceptionTokens"""
-        _log.error("ExceptionToken encountered\n  name: %s\n  type: %s\n  action: %s\n  args: %s\n  context: %s\n" %
-                   (self.name, self._type, action.__name__, args, context))
+        _log.error("ExceptionToken encountered\n  name: %s\n  type: %s\n  action: %s\n  args: %s\n" %
+                   (self._name, self._type, action.__name__, args))
         raise Exception("ExceptionToken NOT HANDLED")
 
     def events(self):
@@ -634,7 +668,7 @@ class Actor(object):
         self._component_members -= set(actor_ids)
 
     def part_of_component(self):
-        return len(self._component_members - set([self.id]))>0
+        return len(self._component_members - set([self._id]))>0
 
     def component_members(self):
         return self._component_members
@@ -646,11 +680,40 @@ class Actor(object):
             self._deployment_requirements = deploy_reqs
 
     def requirements_get(self):
-        return self._deployment_requirements + (
-                [{'op': 'actor_reqs_match',
-                  'kwargs': {'requires': self.requires},
-                  'type': '+'}]
-                if hasattr(self, 'requires') else [])
+        if self._port_property_capabilities is None:
+            self._port_property_capabilities = self._derive_port_property_capabilities()
+        capability_port = [{
+                'op': 'port_property_match',
+                'kwargs': {'port_property': self._port_property_capabilities},
+                'type': '+'
+            }]
+        if hasattr(self, 'requires'):
+            capability_require = [{
+                'op': 'actor_reqs_match',
+                'kwargs': {'requires': self.requires},
+                'type': '+'
+            }]
+        else:
+            capability_require = []
+        if self._replication_data.id is None:
+            replica_nodes = []
+        else:
+            # exclude node with replicas
+            replica_nodes = [{
+                'op': 'replica_nodes',
+                'kwargs': {},
+                'type': '-'
+            }]
+        return self._deployment_requirements + capability_require + capability_port + replica_nodes
+
+    def _derive_port_property_capabilities(self):
+        port_property_capabilities = set([])
+        for port in self.inports.values():
+            port_property_capabilities.update(get_port_property_capabilities(port.properties))
+        for port in self.outports.values():
+            port_property_capabilities.update(get_port_property_capabilities(port.properties))
+        _log.debug("derive_port_property_capabilities:" + str(port_property_capabilities))
+        return get_port_property_runtime(port_property_capabilities)
 
     def signature_set(self, signature):
         if self._signature is None:
@@ -672,21 +735,21 @@ class Actor(object):
     @verify_status([STATUS.DENIED])
     def set_migration_info(self, reply):
         if reply and reply.status == 200 and reply.data["node_id"]:
-            self.migration_info = reply.data
+            self._migration_info = reply.data
             self.fsm.transition_to(Actor.STATUS.MIGRATABLE)
-            _log.info("Migrate actor %s to node %s" % (self.name, self.migration_info["node_id"]))
+            _log.info("Migrate actor %s to node %s" % (self._name, self._migration_info["node_id"]))
             # Inform the scheduler that the actor is ready to migrate.
             self._calvinsys.scheduler_maintenance_wakeup()
         else:
-            _log.info("No possible migration destination found for actor %s" % self.name)
+            _log.info("No possible migration destination found for actor %s" % self._name)
             # Try to enable/migrate actor again after a delay.
             self._calvinsys.scheduler_maintenance_wakeup(delay=True)
 
     @verify_status([STATUS.MIGRATABLE, STATUS.READY])
     def remove_migration_info(self, status):
         if status.status != 200:
-            self.migration_info = None
-            # FIXME: destroy() in actormanager.py was called before trying to migrate. 
+            self._migration_info = None
+            # FIXME: destroy() in actormanager.py was called before trying to migrate.
             #        Need to make the actor runnable again before transition to DENIED.
             #self.fsm.transition_to(Actor.STATUS.DENIED)
 
@@ -695,11 +758,11 @@ class ShadowActor(Actor):
     """A shadow actor try to behave as another actor but don't have any implementation"""
     def __init__(self, actor_type, name='', allow_invalid_transitions=True, disable_transition_checks=False,
                  disable_state_checks=False, actor_id=None, security=None):
-        self.inport_names = []
-        self.outport_names = []
+        self.inport_properties = {}
+        self.outport_properties = {}
         super(ShadowActor, self).__init__(actor_type, name, allow_invalid_transitions=allow_invalid_transitions,
                                             disable_transition_checks=disable_transition_checks,
-                                            disable_state_checks=disable_state_checks, actor_id=actor_id, 
+                                            disable_state_checks=disable_state_checks, actor_id=actor_id,
                                             security=security)
 
     @manage(['_shadow_args'])
@@ -709,11 +772,11 @@ class ShadowActor(Actor):
     def create_shadow_port(self, port_name, port_dir, port_id=None):
         # TODO check if we should create port against meta info
         if port_dir == "in":
-            self.inport_names.append(port_name)
+            self.inport_properties[port_name] = {}
             port = actorport.InPort(port_name, self)
             self.inports[port_name] = port
         else:
-            self.outport_names.append(port_name)
+            self.outport_properties[port_name] = {}
             port = actorport.OutPort(port_name, self)
             self.outports[port_name] = port
         return port
@@ -737,5 +800,5 @@ class ShadowActor(Actor):
                                                             'shadow_params': self._shadow_args.keys()},
                                                  'type': '+'}]
         else:
-            _log.error("Shadow actor %s - %s miss signature" % (self.name, self.id))
+            _log.error("Shadow actor %s - %s miss signature" % (self._name, self._id))
             return self._deployment_requirements

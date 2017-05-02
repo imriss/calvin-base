@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 from copy import copy
 
 class SampleHold(Actor):
@@ -31,15 +31,22 @@ class SampleHold(Actor):
       out    : The currently held token, or the 'default' argument if not sampled yet.
     """
 
-    @manage(['held'])
+    @manage(['held', 'immutable'])
     def init(self, default=None):
-        self.held = default
+        self.set_current(default)
+
+    def current(self):
+        return self.held if self.immutable else copy(self.held)
+
+    def set_current(self, tok):
+        self.immutable = bool(type(tok) is list or type(tok))
+        self.held = tok if self.immutable else copy(tok)
 
     @condition(['sample', 'in'], ['out'])
     def action(self, sample, tok):
         if sample is True:
-            self.held = copy(tok)
-        return ActionResult(production=(self.held, ))
+            self.set_current(tok)
+        return (self.current(), )
 
     action_priority = (action,)
 

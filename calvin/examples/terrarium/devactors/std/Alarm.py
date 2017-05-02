@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, condition
+from calvin.actor.actor import Actor, condition
 
 
 class Alarm(Actor):
@@ -35,6 +35,6 @@ class Alarm(Actor):
         lower = container.get("lower", 0)
         upper = container.get("upper", 0)
         result = val > upper or val < lower
-        return ActionResult(production=(result,))
+        return (result,)
 
     action_priority = (check, )

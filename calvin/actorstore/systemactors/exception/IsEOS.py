@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 from calvin.runtime.north.calvin_token import EOSToken, ExceptionToken
 
 
@@ -30,26 +30,26 @@ class IsEOS(Actor):
       status : 'true' if input token is EOS-token, false otherwise
     """
 
-    def exception_handler(self, action, args, context):
+    def exception_handler(self, action, args):
         self.token = type(args[0]) is EOSToken
-        return ActionResult()
+
 
     @manage([])
     def init(self):
         self.token = None
 
+    @stateguard(lambda self: self.token is not None)
     @condition([], ['status'])
-    @guard(lambda self: self.token is not None)
     def produce(self):
         tok = self.token
         self.token = None
-        return ActionResult(production=(tok,))
+        return (tok,)
 
+    @stateguard(lambda self: self.token is None)
     @condition(['token'])
-    @guard(lambda self, tok: self.token is None)
     def consume(self, tok):
         self.token = False
-        return ActionResult()
+
 
     action_priority = (produce, consume)
 

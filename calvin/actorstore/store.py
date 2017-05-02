@@ -22,12 +22,15 @@ import json
 import re
 from types import ModuleType
 import hashlib
+import numbers
 
 from calvin.csparser.astnode import node_encoder, node_decoder
 from calvin.utilities import calvinconfig
 from calvin.utilities import dynops
 from calvin.utilities.calvinlogger import get_logger
 from calvin.utilities.calvin_callback import CalvinCB
+from calvin.csparser.port_property_syntax import port_property_data
+from calvin.requests import calvinresponse
 
 
 _log = get_logger(__name__)
@@ -218,8 +221,8 @@ class ActorStore(Store):
         actor_class, signer = self._load_pyclass(actor_type, actor_path)
         if actor_class:
             inports, outports = self._gather_ports(actor_class)
-            actor_class.inport_names = inports
-            actor_class.outport_names = outports
+            actor_class.inport_properties = {p: pp for p, pp in inports}
+            actor_class.outport_properties = {p: pp for p, pp in outports}
         return actor_class, signer
 
 
@@ -255,7 +258,7 @@ class ActorStore(Store):
 
     def _parse_docstring(self, class_):
         # Extract port names from docstring
-        docstring = class_.__doc__
+        docstring = inspect.cleandoc(class_.__doc__)
         inputs = []
         outputs = []
         doctext = []
@@ -268,22 +271,103 @@ class ActorStore(Store):
                 dest = outputs
                 continue
             elif dest is doctext:
-                line = line.strip()
-                if line:
-                    dest.append(line)
+                line = line.rstrip()
+                dest.append(line)
                 continue
 
             if dest in [inputs, outputs]:
-                match = re.match(r'^\s*([a-zA-Z][a-zA-Z0-9_]*)\s*:?\s*(.*)$', line)
+                match = re.match(
+                    # Match port name
+                    r'^\s*([a-zA-Z][a-zA-Z0-9_]*)' +
+                    # Match optional port properties
+                    # property names is standard identifiers
+                    # property values kan be lists, strings or numbers
+                    # FIXME be more forgiving for putting whitespace at wrong places or any string value
+                    r'(\((?:[a-zA-Z][a-zA-Z0-9_]*=[a-zA-Z0-9_\-"\.\[\],\s]*)+\))?' +
+                    # Match optional documentation
+                    r'\s*:?\s*(.*)$', line)
                 if match:
-                    dest.append((match.group(1), match.group(2)))
+                    if match.group(2) is not None:
+                        try:
+                            prop_strings_split = [s for s in match.group(2)[1:-1].split(",")]
+                            prop_strings = []
+                            comb = False
+                            # Fix that list value got splitted
+                            for s in prop_strings_split:
+                                if r'[' in s:
+                                    prop_strings.append(s)
+                                    if r']' not in s:
+                                        comb = True
+                                elif comb:
+                                    prop_strings[-1] += ", " + s
+                                    if r']' in s:
+                                        comb = False
+                                elif not comb:
+                                    prop_strings.append(s)
+
+                            port_properties = {}
+                            for s in prop_strings:
+                                key, value = s.split("=", 1)
+                                port_properties[key.strip()] = json.loads(value)
+                        except:
+                            _log.exception("Malformed syntax for port properties %s in actor %s and port %s" %
+                                            (value, class_.__name__, match.group(1)))
+                            port_properties = {}
+                    else:
+                        port_properties = {}
+                    direction = "in" if dest == inputs else "out"
+                    # FIXME Should validation be moved to higher layer?
+                    issues = self._validate_port_properties(port_properties, direction)
+                    if issues:
+                        _log.error("Error in port property of actor %s: %s" % (class_.__name__,
+                                   ", ".join([r.data['reason'] for r in issues])))
+                    dest.append((match.group(1), match.group(3), port_properties))
+
+        while not doctext[-1]:
+            doctext.pop()
 
         return (inputs, outputs, doctext)
 
 
+    def _validate_port_properties(self, port_properties, direction):
+        # TODO break out the validation and consolidate it with codegen.py:ConsolidatePortProperty
+        issues = []
+        for key, values in port_properties.items():
+            if not isinstance(values, (list, tuple)):
+                values = [values]
+            for value in values:
+                if key not in port_property_data.keys():
+                    reason = "Port property {} is unknown".format(key)
+                    issues.append(calvinresponse.CalvinResponse(calvinresponse.BAD_REQUEST, {'reason': reason}))
+                    continue
+                ppdata = port_property_data[key]
+                if ppdata['type'] == "category":
+                    if value not in ppdata['values']:
+                        reason = "Port property {} can only have values {}".format(
+                            key, ", ".join(ppdata['values'].keys()))
+                        issues.append(calvinresponse.CalvinResponse(calvinresponse.BAD_REQUEST, {'reason': reason}))
+                        continue
+                    if direction not in ppdata['values'][value]['direction']:
+                        reason = "Port property {}={} is only for {} ports".format(
+                            key, value, ppdata['values'][value]['direction'])
+                        issues.append(calvinresponse.CalvinResponse(calvinresponse.BAD_REQUEST, {'reason': reason}))
+                        continue
+                if ppdata['type'] == 'scalar':
+                    if not isinstance(value, numbers.Number):
+                        reason = "Port property {} can only have scalar values".format(key)
+                        issues.append(calvinresponse.CalvinResponse(calvinresponse.BAD_REQUEST, {'reason': reason}))
+                        continue
+                if ppdata['type'] == 'string':
+                    if not isinstance(value, basestring):
+                        reason = "Port property {} can only have string values".format(key)
+                        issues.append(calvinresponse.CalvinResponse(calvinresponse.BAD_REQUEST, {'reason': reason}))
+                        continue
+        return issues
+
     def _gather_ports(self, class_):
         inputs, outputs, _ = self._parse_docstring(class_)
-        return ([p for (p, _) in inputs], [p for (p, _) in outputs])
+        # tuples with port names and port properties
+        return ([(p, pp) for (p, _, pp) in inputs], [(p, pp) for (p, _, pp) in outputs])
 
 
     def _get_args(self, actor_class):
@@ -371,259 +455,6 @@ class ActorStore(Store):
                 actors = actors + [x for x in _files_in_dir(path, ('.py', '.comp')) if _basename(x) == name]
         return l + actors
 
-
-class DocumentationStore(ActorStore):
-    """Interface to documentation"""
-
-    def module_docs(self, namespace):
-        """
-        Return a dict with docstrings for namespace.
-
-        Since a namespace can be implemented in more than one place,
-        the path where docstring was found is used as key.
-        """
-        doc = {
-            'ns': namespace, 'name': '',
-            'type': 'module',
-            'short_desc': '',
-            'long_desc': '',
-            'modules': self.modules(namespace),
-            'actors': self.actors(namespace),
-            }
-        paths = self.paths_for_module(namespace)
-        for path in paths:
-            docpath = os.path.join(path, '__init__.py')
-            pymodule = self._load_pymodule('__init__', docpath)
-            if pymodule and pymodule.__doc__:
-                doclines = pymodule.__doc__.splitlines()
-                doc['short_desc'] = doclines[0]
-                doc['long_desc'] = '\n'.join(doclines[2:])
-                break
-        if not doc['short_desc'] and not doc['long_desc']:
-            doc['short_desc'] = 'No documentation for "%s"' % namespace
-        return doc
-
-
-    def actor_docs(self, actor_type):
-        found, is_primitive, actor, signer = self.lookup(actor_type)
-        if not found:
-            return None
-        if is_primitive:
-            docs = self.primitive_docs(actor_type, actor)
-        else:
-            docs = self.component_docs(actor_type, actor)
-        return docs
-
-
-    def primitive_docs(self, actor_type, actor_class):
-        """Combine info from class and docstring into actor raw docs"""
-        namespace, name = actor_type.rsplit('.', 1)
-        # Extract docs
-        inputs, outputs, doctext = self._parse_docstring(actor_class)
-
-        doc = {
-            'ns': namespace, 'name': name,
-            'type': 'actor',
-            'short_desc': doctext[0],
-            'long_desc': '\n'.join(doctext[1:]),
-            'args': self._get_args(actor_class),
-            'inputs': inputs,
-            'outputs': outputs,
-            }
-        return doc
-
-
-    def component_docs(self, comp_type, compdef):
-        """Combine info from compdef to raw docs"""
-        namespace, name = comp_type.rsplit('.', 1)
-        if type(compdef) is dict:
-            doctext = compdef['docstring'].splitlines()
-            return {
-                'ns': namespace, 'name': name,
-                'type': 'component',
-                 'short_desc': doctext[0],
-                 'long_desc': '\n'.join(doctext[1:]),
-                 'requires':list({compdef['structure']['actors'][a]['actor_type'] for a in compdef['structure']['actors']}),
-                 'args': {'mandatory':compdef['arg_identifiers'], 'optional':{}},
-                 'inputs': [(p, self._fetch_port_docs(compdef, 'in', p)) for p in compdef['inports']],
-                 'outputs': [(p, self._fetch_port_docs(compdef, 'out', p)) for p in compdef['outports']],
-            }
-        # print compdef.inports, compdef.outports
-        doctext = compdef.docstring.splitlines()
-        doc = {
-            'ns': namespace, 'name': name,
-            'type': 'component',
-            'short_desc': doctext[0],
-            'long_desc': '\n'.join(doctext[1:]),
-            'requires':["FIXME"], # FIXME
-            'args': {'mandatory':compdef.arg_names, 'optional':{}},
-            'inputs': [(x, "FIXME") for x in compdef.inports or []], # FIXME append port docs
-            'outputs': [(x, "FIXME") for x in compdef.outports or []], # FIXME append port docs
-            'definition':compdef.children[0]
-        }
-        return doc
-
-
-    def _fetch_port_docs(self, compdef, port_direction, port_name):
-        structure = compdef['structure']
-        for c in structure['connections']:
-            if port_direction.startswith('in'):
-                actor, port, target_actor, target_port = c['src'], c['src_port'],c['dst'], c['dst_port']
-            else:
-                actor, port, target_actor, target_port = c['dst'], c['dst_port'], c['src'], c['src_port']
-            if not actor and port == port_name and target_actor in structure['actors']:
-                return self.port_docs(structure['actors'][target_actor]['actor_type'], port_direction, target_port)
-        return 'Not documented'
-
-
-    def port_docs(self, actor_type, port_direction, port_name):
-        docs = ''
-        adoc = self.actor_docs(actor_type)
-        if not adoc:
-            return docs
-        pdocs = adoc['inputs'] if port_direction.startswith('in') else adoc['outputs']
-        for port, pdoc in pdocs:
-            if port == port_name:
-                docs = pdoc
-                break
-        return docs
-
-
-    def root_docs(self):
-        doc = {
-            'ns': None, 'name': 'Calvin',
-            'type': 'module',
-            'short_desc': 'Merging cloud and IoT',
-            'long_desc': """A systematic approach to handling impedence mismatch in device-to-device, device-to-service, and service-to-service operations.""",
-            'modules': self.modules(),
-            'footer': '(C) 2015',
-            }
-        return doc
-
-
-    def _list_items(self, items, namespace):
-        lines = []
-        for name in items:
-            full_name = namespace + "." + name if namespace else name
-            lines.append(self._format_terse(self.help_raw(full_name)))
-        return '\n\n'.join(lines)
-
-
-    def _list_ports(self, items):
-        lines = []
-        for name, desc in items:
-            lines.append("%s\n:    %s" % (name, desc))
-        return '\n\n'.join(lines)
-
-    def _escape_string_arg(self, arg):
-        if type(arg) != str:
-            return arg
-        return '"'+arg.encode('string_escape')+'"'
-
-    def _format_args(self, args):
-        opt_list = ['{0}={1}'.format(param, self._escape_string_arg(default)) for param, default in args['optional'].iteritems()]
-        arg_list = args['mandatory'] + opt_list
-        return ', '.join(arg_list)
-
-
-    def _format_detailed(self, raw):
-        doc = ''
-        if 'header' in raw:
-            doc += "{header}\n----\n".format(**raw)
-        if raw['type'] == 'module':
-            doc += self._format_detailed_module(raw)
-        else:
-            doc += self._format_detailed_actor(raw)
-        if 'footer' in raw:
-            doc += "\n----\n{footer}".format(**raw)
-        return doc
-
-
-    def _format_detailed_actor(self, raw):
-        doc = "#### {ns}.{name}({fargs})\n\n{short_desc}\n\n".format(fargs=self._format_args(raw['args']), **raw)
-        doc += "%s\n\n" % raw['long_desc'] if raw['long_desc'] else ''
-        if raw['type'] == 'component':
-            doc += '\n##### Requires\n\n{req_list}\n'.format(req_list=', '.join(raw['requires']))
-        if raw['inputs']:
-            doc += '\n##### Inputs\n\n{ports}\n'.format(ports=self._list_ports(raw['inputs']))
-        if raw['outputs']:
-            doc += '\n##### Outputs\n\n{ports}\n'.format(ports=self._list_ports(raw['outputs']))
-        return doc
-
-
-    def _format_detailed_module(self, raw):
-        if not raw['ns']:
-            doc = "## {name}\n\n{short_desc}\n\n".format(**raw)
-        else:
-            doc = "## Module: {ns}\n\n{short_desc}\n\n".format(**raw)
-        doc += "%s\n\n" % raw['long_desc'] if raw['long_desc'] else ''
-        if raw['modules']:
-            doc += '\n### Modules\n\n{items}\n'.format(items=self._list_items(raw['modules'], raw['ns']))
-        if 'actors' in raw and raw['actors']:
-            doc += '\n### Actors\n\n{items}\n'.format(items=self._list_items(raw['actors'], raw['ns']))
-        return doc
-
-
-    def _format_compact(self, raw):
-        doc = ''
-        if raw['type'] == 'module':
-            doc += self._format_compact_module(raw)
-        else:
-            doc += self._format_compact_actor(raw)
-        return doc
-
-
-    def _format_compact_actor(self, raw):
-        doc = "{ns}.{name}({fargs}): {short_desc}\n".format(fargs=self._format_args(raw['args']), **raw)
-        if raw['type'] == 'component':
-            doc += 'Requires: %s\n' % ', '.join(raw['requires'])
-        if raw['inputs']:
-           doc += 'Inputs: %s\n' % ', '.join([p for p, _ in raw['inputs']])
-        if raw['outputs']:
-           doc += 'Outputs: %s\n' % ', '.join([p for p, _ in raw['outputs']])
-        return doc
-
-
-    def _format_compact_module(self, raw):
-        doc = "%s: %s\n" % (raw['ns'] if raw['ns'] else raw['name'], raw['short_desc'])
-        if raw['modules']:
-            doc += 'Modules: %s\n' % ", ".join(raw['modules'])
-        if 'actors' in raw and raw['actors']:
-            doc += 'Actors: %s\n' % ", ".join(raw['actors'])
-        return doc
-
-
-    def _format_terse(self, raw):
-        """Return a terse description as a single line."""
-        title = raw['ns'] if raw['type'] == 'module' else raw['name']
-        doc = "%s\n:    %s" % (title , raw['short_desc'])
-        return doc
-
-
-    def help_raw(self, what):
-        """
-        Return help for 'what' in a structured form, but not suitable for printing as-is.
-        If what is None, return help on the command itself.
-        """
-        if what:
-            # First check for actors and components
-            doc = self.actor_docs(what)
-            if not doc:
-                doc = self.module_docs(what)
-        else:
-            doc = self.root_docs()
-        return doc
-
-
-    def help(self, what=None, compact=False, formatting='md'):
-        """Return help for """
-        raw = self.help_raw(what)
-        # print "raw", raw
-        if not raw:
-            doc = 'No help for "%s"' % what
-        else:
-            doc = self._format_compact(raw) if compact else self._format_detailed(raw)
-        return doc
 
 
 class GlobalStore(ActorStore):
@@ -794,6 +625,118 @@ class GlobalStore(ActorStore):
         filtered_actor_type_iter.set_name("global_lookup")
         return filtered_actor_type_iter
 
+from docobject import ErrorDoc, ModuleDoc, ComponentDoc, ActorDoc
+
+class DocumentationStore(ActorStore):
+    """Interface to documentation"""
+    def __init__(self):
+        super(DocumentationStore, self).__init__()
+        self.docs = self.root_docs()
+
+
+    def module_docs(self, namespace):
+        modules = [self.module_docs(x) for x in self.modules(namespace)]
+        actors = [self.actor_docs(".".join([namespace, x])) for x in self.actors(namespace)]
+        paths = self.paths_for_module(namespace)
+        for path in paths:
+            docpath = os.path.join(path, '__init__.py')
+            pymodule, _ = self._load_pymodule('__init__', docpath)
+            if pymodule and pymodule.__doc__:
+                doclines = pymodule.__doc__.splitlines()
+                return ModuleDoc(namespace, modules, actors, doclines)
+        return ErrorDoc(namespace, None, "Unknown module")
+
+
+    def actor_docs(self, qualified_name):
+        found, is_primitive, actor, _ = self.lookup(qualified_name)
+        if not found:
+            return ErrorDoc(qualified_name, None, "Unknown actor")
+        if not actor:
+            return ErrorDoc(qualified_name, None, "Broken actor")
+
+        namespace, name = qualified_name.rsplit('.', 1)
+        if is_primitive:
+            args = self._get_args(actor)
+            inputs, outputs, doclines = self._parse_docstring(actor)
+            requires = getattr(actor, 'requires', [])
+            doc = ActorDoc(namespace, name, args, inputs, outputs, doclines, requires)
+        else:
+            if type(actor) is dict:
+                return ErrorDoc(namespace, name, "Old-style components are not valid")
+            args = {'mandatory':actor.arg_names, 'optional':{}}
+            inputs = [(x, "", {}) for x in actor.inports or []] # FIXME append port docs and port properties
+            outputs = [(x, "", {}) for x in actor.outports or []] # FIXME append port docs and port properties
+            doclines = actor.docstring.splitlines()
+            definition = actor.children[0]
+            doc = ComponentDoc(namespace, name, args, inputs, outputs, doclines, definition)
+        return doc
+
+
+    def root_docs(self):
+        modules = [self.module_docs(x) for x in self.modules()]
+        return ModuleDoc('Calvin', modules, [], ["A systematic approach to handling impedance mismatch in IoT."])
+
+
+    def metadata(self, qualified_name):
+        doc = self._help(qualified_name)
+        return doc.metadata()
+
+    def _help(self, what):
+        if not what:
+            doc = self.docs
+        else:
+            search_list = what.split('.')
+            doc = self.docs.search(search_list)
+        if not doc:
+            doc = ErrorDoc(what, None, "No such entity")
+        return doc
+
+
+    def help_raw(self, what=None):
+        doc = self._help(what)
+        metadata = doc.metadata()
+        metadata['short_desc'] = doc.short_desc
+        metadata['long_desc'] = doc.docs
+        if doc.label in ["Actor", "Component"]:
+            metadata['input_docs'] = {port.name:port.docs for port in doc.inports}
+            metadata['output_docs'] = {port.name:port.docs for port in doc.outports}
+        return json.dumps(metadata, default=node_encoder)
+
+
+    def _formatter(self, doc, compact=False, formatting='plain', links=False):
+        if compact:
+            return doc.compact
+        if formatting != 'md':
+            return doc.detailed
+        return doc.markdown_links if links else doc.markdown
+
+    def help(self, what=None, compact=False, formatting='plain', links=False):
+        """Return help for <what>"""
+        doc = self._help(what)
+        formatter = self._formatter(doc, compact, formatting, links)
+        return formatter()
+        # if compact:
+        #     return doc.compact()
+        # return doc.detailed(md=bool(formatting == 'md'), links=links)
+
+
+    def documentation(self, formatting='md', links=True):
+        doc = self.docs
+        docs = []
+        visit = [doc]
+        while visit:
+            next = visit.pop(0)
+            if type(next) is ErrorDoc:
+                continue
+            if type(next) is ModuleDoc:
+                visit.extend(next.actors)
+                visit.extend(next.modules)
+            docs.append(next)
+        # docs = [x.detailed(md=bool(formatting == 'md'), links=links) for x in docs if type(x) is not ErrorDoc]
+        docs = [self._formatter(x, False, formatting, links)() for x in docs if type(x) is not ErrorDoc]
+        docs = "\n".join(docs)
+        return docs
+
 
 
 def install_component(namespace, definition, overwrite):
@@ -803,70 +746,33 @@ def install_component(namespace, definition, overwrite):
 
 if __name__ == '__main__':
     import json
+    import sys
 
-    a = ActorStore()
-    ds = DocumentationStore()
+    d = DocumentationStore()
+    def gather_actors(module):
+        # Depth first
+        l = []
+        for m in d.modules(module):
+            l = l + gather_actors(m)
+        actors = d.actors(module)
+        if module:
+            # Add namespace
+            actors = ['.'.join([module, a]) for a in actors]
+        return l + actors
 
-    print ds.help()
-    print "====="
-    print ds.help(compact=True)
-    print "====="
-    print ds.help(what='xyz', compact=True)
-    print "====="
-    print ds.help(what='std', compact=False)
+    def list_actors():
+        print "Actors:"
+        l = gather_actors('')
+        for a in l:
+            print "  ", a
 
+    def list_actors_with_default_args():
+        l = gather_actors('')
+        # bad_args = [x for x in l if not 'args' in d.metadata(x)]
+        with_defaults = [x for x in l if 'args' in d.metadata(x) and d.metadata(x)['args']['optional']]
+        print "With default params:"
+        for a in with_defaults:
+            print "  ", a, ":", d.metadata(a)['args']['optional'].keys()
 
-    print ds.help(what='std', compact=True)
-    print ds.help(what='std.Constant', compact=False)
-    print "====="
-    print ds.help(what='std.SumActor', compact=True)
-    print "====="
-    print ds.help(what='std.Foo', compact=False)
-    print "====="
-    print ds.help(what='misc.ArgWrapper', compact=True)
-
-    print
-    for actor in ['std.Constant', 'std.Join', 'std.Identity', 'io.FileReader']:
-        found, is_primitive, actor_class, signer = a.lookup(actor)
-        if not found or not is_primitive:
-            raise Exception('Bad actor')
-        print actor, ":", ds._get_args(actor_class)
-    #
-    #
-    # print json.dumps(a.find_all_modules(), sort_keys=True, indent=4)
-    # print a.modules()
-    # print a.modules('foo')
-    # print a.modules('foo.bar')
-    # print a.modules('network')
-    # print ds.module_docs('foo.bar')
-    # print "\n================\n"
-    #
-    # for m in a.modules():
-    #     print m
-    #     print "  ", a.actors(m)
-    # actor_class =  a.lookup('std.Tee')
-    # print actor_class
-    # print a.lookup('misc.ArgWrapper')
-    # for x in ['std.Tee', 'foo', 'foo.bar', 'foo.bar.baz', 'misc.ArgWrapper', 'no.way']:
-    #     print
-    #     print "------------------------"
-    #     print ds.docs_for(x)
-    #     print "------------------------"
-    #
-    #
-    # astore = ActorStore()
-    # actor_types = []
-    #
-    # def gather_actors(module):
-    #     # Depth first
-    #     l = []
-    #     for m in DocumentationStore().modules(module):
-    #         l = l + gather_actors(m)
-    #     actors = DocumentationStore().actors(module)
-    #     if module:
-    #         # Add namespace
-    #         actors = ['.'.join([module, a]) for a in actors]
-    #     return l + actors
-    #
-    #
-    # print gather_actors('')
+    list_actors()
+    list_actors_with_default_args()

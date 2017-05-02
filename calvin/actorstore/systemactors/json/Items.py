@@ -16,7 +16,7 @@
 
 # encoding: utf-8
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 from calvin.runtime.north.calvin_token import EOSToken, ExceptionToken
 from copy import copy
 
@@ -39,31 +39,30 @@ class Items(Actor):
         self.data = []
         self.has_data = False
 
+    @stateguard(lambda self: not self.has_data)
     @condition(['list'], [])
-    @guard(lambda self, data: not self.has_data)
     def consume_list(self, data):
         if type(data) is not list:
             self.data = [ExceptionToken()]
             self.has_data = True
-            return ActionResult()
+            return
         if not data:
             # Empty list => no output
-            return ActionResult()
+            return
         try:
             self.data = copy(data)
             self.has_data = True
         except:
             pass
-        return ActionResult()
 
+    @stateguard(lambda self: self.has_data)
     @condition([], ['item'])
-    @guard(lambda self: self.has_data)
     def produce_item(self):
         res = self.data.pop(0)
         if not self.data:
             self.data = []
             self.has_data = False
-        return ActionResult(production=(res, ))
+        return (res, )
 
 
     action_priority = (produce_item, consume_list)

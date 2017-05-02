@@ -16,7 +16,7 @@
 
 # encoding: utf-8
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 # from calvin.runtime.north.calvin_token import EOSToken
 
 from calvin.utilities.calvinlogger import get_logger
@@ -55,55 +55,54 @@ class TCPServer(Actor):
     def did_migrate(self):
         self.server = None
 
+    @stateguard(lambda self: not self.host and not self.port and not self.server)
     @condition(['host', 'port'], [])
-    @guard(lambda self, host, port: not self.host and not self.port and not self.server)
     def setup(self, host, port):
         self.host = host
         self.port = port
-        return ActionResult()
+        
 
+    @stateguard(lambda self: self.host and self.port and not self.server)
     @condition()
-    @guard(lambda self: self.host and self.port and not self.server)
     def start(self):
         try:
             self.server = self['server'].start(self.host, self.port, self.mode, self.delimiter, self.max_length)
         except Exception as e:
             _log.exception(e)
-        return ActionResult()
+        
 
+    @stateguard(lambda self: self.server and self.server.connection_pending())
     @condition()
-    @guard(lambda self: self.server and self.server.connection_pending())
     def accept(self):
         addr, conn = self.server.accept()
         self.connections[addr] = conn
-        return ActionResult()
+        
 
+    @stateguard(lambda self: self.connections)
     @condition(['handle', 'token'])
-    @guard(lambda self, handle, token: self.connections)
     def send(self, handle, token):
         for h, c in self.connections.items():
             if h == handle:
                 self.server.send(c, token.encode('utf-8'))
-        return ActionResult(production=())
 
+    @stateguard(lambda self: self.connections and any([c.data_available for c in self.connections.values()]))
     @condition([], ['handle', 'token'])
-    @guard(lambda self: self.connections and any([c.data_available for c in self.connections.values()]))
     def receive(self):
         for h, c in self.connections.items():
             if c.data_available:
                 data = self.server.receive(c)
                 break
-        return ActionResult(production=(h, data))
+        return (h, data)
 
+    @stateguard(lambda self: self.connections and any([c.connection_lost for c in self.connections.values()]))
     @condition()
-    @guard(lambda self: self.connections and any([c.connection_lost for c in self.connections.values()]))
     def close(self):
         for handle, connection in self.connections.items():
             if connection.connection_lost:
                 connection.connection_lost = False
                 del self.connections[handle]
                 break
-        return ActionResult()
+        
 
     action_priority = (accept, receive, send, close, setup, start)
     requires = ['calvinsys.network.serverhandler']

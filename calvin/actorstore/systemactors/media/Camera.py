@@ -1,4 +1,4 @@
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 
 
 class Camera(Actor):
@@ -12,11 +12,12 @@ class Camera(Actor):
       image: generated image
     """
 
-    @manage(['device', 'width', 'height'])
+    @manage(['device', 'width', 'height', 'trigger'])
     def init(self, device=0, width=640, height=480):
         self.device = device
         self.width = width
         self.height = height
+        self.trigger = None
         self.setup()
 
     def setup(self):
@@ -32,15 +33,18 @@ class Camera(Actor):
     def will_migrate(self):
         self.camera.close()
 
-    @condition(action_input=['trigger'], action_output=['image'])
-    @guard(lambda self, trigger : trigger)
+    @stateguard(lambda self: self.trigger is True)
+    @condition(action_output=['image'])
     def get_image(self, trigger):
+        self.trigger = None
         image = self.camera.get_image()
-        return ActionResult(production=(image, ))
+        return (image, )
 
+    @stateguard(lambda self: trigger is None)
     @condition(action_input=['trigger'])
-    def empty(self, trigger):
-        return ActionResult()
+    def trigger_action(self, trigger):
+        self.trigger = True if trigger else None
+        
 
-    action_priority = (get_image, empty)
+    action_priority = (get_image, trigger_action)
     requires =  ['calvinsys.media.camerahandler']

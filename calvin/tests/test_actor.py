@@ -31,9 +31,9 @@ def create_actor(node):
     actor_id = actor_manager.new('std.Identity', {})
     actor = actor_manager.actors[actor_id]
     actor._calvinsys = Mock()
-    actor.inports['token'].set_queue(queue.fanout_fifo.FanoutFIFO(5))
-    actor.inports['token'].queue.add_reader(actor.inports['token'].id)
-    actor.outports['token'].set_queue(queue.fanout_fifo.FanoutFIFO(5))
+    actor.inports['token'].set_queue(queue.fanout_fifo.FanoutFIFO({'queue_length': 4, 'direction': "in"}, {}))
+    actor.inports['token'].queue.add_reader(actor.inports['token'].id, {})
+    actor.outports['token'].set_queue(queue.fanout_fifo.FanoutFIFO({'queue_length': 4, 'direction': "out"}, {}))
     return actor
 
 
@@ -77,6 +77,7 @@ def test_did_disconnect(actor, inport_ret_val, outport_ret_val, expected):
         port.is_connected = Mock(return_value=outport_ret_val)
 
     actor.fsm = Mock()
+    actor.fsm.state = Mock(return_value=Actor.STATUS.READY)
     actor.did_disconnect(None)
     if expected:
         actor.fsm.transition_to.assert_called_with(Actor.STATUS.READY)
@@ -100,8 +101,8 @@ def test_connections():
 
     in_peer_port = TestPort("x", "out")
     out_peer_port = TestPort("y", "in")
-    out_peer_port.queue.add_reader(out_peer_port.id)
-    in_peer_port.queue.add_reader(inport.id)
+    out_peer_port.queue.add_reader(out_peer_port.id, {})
+    in_peer_port.queue.add_reader(inport.id, {})
 
     inport.attach_endpoint(LocalInEndpoint(inport, in_peer_port))
     outport.attach_endpoint(LocalOutEndpoint(outport, out_peer_port))
@@ -119,11 +120,13 @@ def test_state(actor):
     outport = actor.outports['token']
     correct_state = {
         '_component_members': set([actor.id]),
+        '_has_started': False,
         '_deployment_requirements': [],
-        '_managed': set(['dump', '_signature', 'id', '_deployment_requirements', 'name', 'subject_attributes', 'migration_info']),
+        '_managed': set(['dump', '_has_started', '_signature', '_id', '_deployment_requirements', '_name', '_subject_attributes', '_migration_info', '_port_property_capabilities', '_replication_data', 'last']),
         '_signature': None,
         'dump': False,
-        'id': actor.id,
+        '_id': actor.id,
+        '_port_property_capabilities': None,
         'inports': {'token': {'properties': {'direction': 'in',
                                              'routing': 'default',
                                              'nbr_peers': 1},
@@ -135,12 +138,13 @@ def test_state(actor):
                                                 {'data': 0, 'type': 'Token'}],
                                        'queuetype': 'fanout_fifo',
                                        'read_pos': {inport.id: 0},
+                                       'reader_offset': {inport.id: 0},
                                        'readers': [inport.id],
                                        'tentative_read_pos': {inport.id: 0},
                                        'write_pos': 0},
                               'id': inport.id,
                               'name': 'token'}},
-        'name': '',
+        '_name': '',
         'outports': {'token': {'properties': {'direction': 'out',
                                               'routing': 'fanout',
                                               'nbr_peers': 1},
@@ -152,6 +156,7 @@ def test_state(actor):
                                                  {'data': 0, 'type': 'Token'}],
                                         'queuetype': 'fanout_fifo',
                                         'read_pos': {},
+                                        'reader_offset': {},
                                         'readers': [],
                                         'tentative_read_pos': {},
                                         'write_pos': 0},
@@ -191,10 +196,14 @@ def test_component(actor):
 
 
 def test_requirements(actor):
-    assert actor.requirements_get() == []
+    assert actor.requirements_get()[:-1] == []
+    assert actor.requirements_get()[-1]['op'] == 'port_property_match'
     actor.requirements_add([1, 2, 3])
-    assert actor.requirements_get() == [1, 2, 3]
+    assert actor.requirements_get()[:-1] == [1, 2, 3]
+    assert actor.requirements_get()[-1]['op'] == 'port_property_match'
     actor.requirements_add([4, 5])
-    assert actor.requirements_get() == [4, 5]
+    assert actor.requirements_get()[:-1] == [4, 5]
+    assert actor.requirements_get()[-1]['op'] == 'port_property_match'
     actor.requirements_add([6, 7], extend=True)
-    assert actor.requirements_get() == [4, 5, 6, 7]
+    assert actor.requirements_get()[:-1] == [4, 5, 6, 7]
+    assert actor.requirements_get()[-1]['op'] == 'port_property_match'

@@ -17,6 +17,9 @@
 from datetime import datetime
 from calvin.actorstore.store import GlobalStore
 from calvin.utilities import dynops
+from calvin.utilities.calvinlogger import get_logger
+
+_log = get_logger(__name__)
 
 class PolicyInformationPoint(object):
 
@@ -39,7 +42,7 @@ class PolicyInformationPoint(object):
         self.actor_desc = None
 
     def get_attribute_value(self, attribute_type, attribute):
-    	"""Return the specified attribute if it exists in attributes dictionary"""
+        """Return the specified attribute if it exists in attributes dictionary"""
         value = self.attributes[attribute_type][attribute]
         if hasattr(value, '__call__'):
             # The value is a function, call the function.
@@ -62,6 +65,7 @@ class PolicyInformationPoint(object):
         return datetime.now().strftime('%H:%M')
 
     def actor_desc_lookup(self, actorstore_signature, callback):
+        _log.debug("actor_desc_lookup:\n\t actorstore_signature={}\n\tcallback={}".format(actorstore_signature, callback))
         desc_iter = self.actorstore.global_lookup_iter(actorstore_signature, node_id=self.request["resource"]["node_id"])
         desc_iter.set_cb(self._set_actor_desc, desc_iter, callback)
         self._set_actor_desc(desc_iter, callback)

@@ -30,7 +30,7 @@ def compile_script(source_text, filename, credentials=None, verify=True):
 
 # FIXME: It might make sense to turn this function into a plain asynchronous security check.
 #        Caller can then call compile_script based on status
-def compile_script_check_security(source_text, filename, cb, credentials=None, verify=True, node=None):
+def compile_script_check_security(source_text, filename, cb, security=None, content=None, verify=True, node=None, signature=None):
     """
     Compile a script and return a tuple (deployable, errors, warnings).
 
@@ -42,42 +42,22 @@ def compile_script_check_security(source_text, filename, cb, credentials=None, v
     N.B. If callback 'cb' is given, this method calls cb(deployable, errors, warnings) and returns None
     N.B. If callback 'cb' is given, and method runs to completion, cb is called with additional parameter 'security' (?)
     """
-
     def _exit_with_error(callback):
         """Helper method to generate a proper error"""
         it = IssueTracker()
         it.add_error("UNAUTHORIZED", info={'status':401})
         callback({}, it)
-
-
-    def _handle_authentication_decision(source_text, appname, verify, authentication_decision, security, org_cb, content=None):
-        if not authentication_decision:
-            _log.error("Authentication failed")
-            # This error reason is detected in calvin control and gives proper REST response
-            _exit_with_error(org_cb)
-
-        verified, signer = security.verify_signature_content(content, "application")
-        if not verified:
-            # Verification not OK if sign or cert not OK.
-            _log.error("Failed application verification")
-            # This error reason is detected in calvin control and gives proper REST response
-            _exit_with_error(org_cb)
-
-        security.check_security_policy(
-            CalvinCB(_handle_policy_decision, source_text, appname, verify, security=security, org_cb=org_cb),
-            "application",
-            signer=signer
-        )
+        return
 
     def _handle_policy_decision(source_text, appname, verify, access_decision, org_cb, security=None):
         if not access_decision:
             _log.error("Access denied")
             # This error reason is detected in calvin control and gives proper REST response
             _exit_with_error(org_cb)
+            return
 
-        deployable, issutracker = compile_script(source_text, appname)
-
-        org_cb(deployable, issutracker, security=security)
+        deployable, issuetracker = compile_script(source_text, appname)
+        org_cb(deployable, issuetracker, security=security)
 
     #
     # Actual code for compile_script
@@ -85,17 +65,24 @@ def compile_script_check_security(source_text, filename, cb, credentials=None, v
     appname = appname_from_filename(filename)
     # FIXME: if node is None we bypass security even if enabled. Is that the intention?
     if node is not None and security_enabled():
-        if credentials:
-            content = Security.verify_signature_get_files(filename, skip_file=True)
-            # content is ALWAYS a dict if skip_file is True
-            content['file'] = source_text
-        else:
-            content = None
         # FIXME: If cb is None, we will return from this method with None instead of a tuple, failing silently
-        sec = Security(node)
-        sec.authenticate_subject(
-            credentials,
-            callback=CalvinCB(_handle_authentication_decision, source_text, appname, verify, security=sec, org_cb=cb, content=content)
+        if security:
+            sec = security
+        else:
+            sec = Security(node)
+
+
+        verified, signer = sec.verify_signature_content(content, "application")
+        if not verified:
+            # Verification not OK if sign or cert not OK.
+            _log.error("Failed application verification")
+            # This error reason is detected in calvin control and gives proper REST response
+            _exit_with_error(cb)
+            return
+        sec.check_security_policy(
+            CalvinCB(_handle_policy_decision, source_text, appname, verify, security=security, org_cb=cb),
+            element_type = "application",
+            element_value = signer
         )
         return
 

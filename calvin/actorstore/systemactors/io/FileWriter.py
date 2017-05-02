@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 from calvin.runtime.north.calvin_token import EOSToken, ExceptionToken
 
 from calvin.utilities.calvinlogger import get_logger
@@ -70,25 +70,22 @@ class FileWriter(Actor):
         self.counter += 1
         self.file = self['file'].open(fname, "w")
 
-    def exception_handler(self, action, args, exceptions):
+    def exception_handler(self, action, args):
         self['file'].close(self.file)
         self.file = None
-        return ActionResult(production=())
 
+    @stateguard(lambda self: not self.file)
     @condition(action_input=['data'])
-    @guard(lambda self, _: not self.file)
-    def open(self, data):
+    def openf(self, data):
         self.setup()
         self.file.write_line(data)
-        return ActionResult(production=())
 
+    @stateguard(lambda self: self.file)
     @condition(action_input=['data'])
-    @guard(lambda self, _: self.file)
-    def write(self, data):
+    def writef(self, data):
         self.file.write_line(data)
-        return ActionResult(production=())
 
-    action_priority = (write, open)
+    action_priority = (writef, openf)
     requires = ['calvinsys.io.filehandler']
 
     test_args = [absolute_basename('test_file'), 'testing']

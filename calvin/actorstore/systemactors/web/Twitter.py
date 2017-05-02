@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition
+from calvin.actor.actor import Actor, manage, condition
 
 from calvin.utilities.calvinlogger import get_logger
 
@@ -42,7 +42,7 @@ class Twitter(Actor):
     @condition(action_input=['status'])
     def post_update(self, status):
         self['twitter'].post_update(status)
-        return ActionResult()
+        
 
     action_priority = (post_update,)
     requires = ['calvinsys.web.twitter']

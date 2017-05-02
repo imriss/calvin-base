@@ -1,4 +1,4 @@
-from calvin.actor.actor import Actor, ActionResult, condition
+from calvin.actor.actor import Actor, condition
 
 
 class FaceDetect(Actor) :
@@ -24,7 +24,7 @@ class FaceDetect(Actor) :
     @condition(['image'], ['faces'])
     def detect(self, image):
         found = self.image.detect_face(image)
-        return ActionResult(production=(found, ))
+        return (found, )
 
     action_priority = (detect, )
     requires =  ['calvinsys.media.image']

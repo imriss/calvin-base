@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, manage, condition, ActionResult
+from calvin.actor.actor import Actor, manage, condition
 
 
 def value_for_key(d, keypath):
@@ -44,7 +44,8 @@ class Format(Actor):
     def init(self, fmt):
         self.fmt = fmt
         self.use('calvinsys.native.python-re', shorthand="regex")
-        self.fmtkeys = self['regex'].findall(Format.REGEX, fmt)
+        tmp = fmt.replace(r"\{", "").replace(r"\}", "")
+        self.fmtkeys = self['regex'].findall(Format.REGEX, tmp)
 
     @condition(['dict'], ['text'])
     def action(self, d):
@@ -57,14 +58,15 @@ class Format(Actor):
         retval = self.fmt
         for key, value in res.iteritems():
             retval = retval.replace('{' + key + '}', str(value))
+        retval = retval.replace(r"\{", "{").replace(r"\}", "}")
 
-        return ActionResult(production=(retval, ))
+        return (retval, )
 
     action_priority = (action, )
     requires = ['calvinsys.native.python-re']
 
-    test_args = ["{huey.dewey.louie}"]
+    test_args = [r"{huey.dewey.louie} \{huey.dewey.louie\}"]
     test_set = [
         {'in': {'dict': [{'huey': {'dewey': {'louie': 'gotcha!'}}}]}},
-        {'out': {'text': ['gotcha!']}}
+        {'out': {'text': ['gotcha! {huey.dewey.louie}']}},
     ]

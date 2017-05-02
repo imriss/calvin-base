@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 from calvin.utilities.calvinlogger import get_logger
 
 _log = get_logger(__name__)
@@ -50,38 +50,38 @@ class HTTPGet(Actor):
         self.received_headers = False
 
     def will_migrate(self):
-        self.reset_request()        
+        self.reset_request()
 
     def did_migrate(self):
         self.setup()
-        
+
+    @stateguard(lambda self: self.request is None)
     @condition(action_input=['URL', 'params', 'header'])
-    @guard(lambda self, url, params, header: self.request is None)
     def new_request(self, url, params, header):
         url = url.encode('ascii', 'ignore')
         self.request = self['http'].get(url, params, header)
-        return ActionResult()
+        
 
+    @stateguard(lambda self: self.request and not self.received_headers and self['http'].received_headers(self.request))
     @condition(action_output=['status', 'header'])
-    @guard(lambda self: self.request and not self.received_headers and self['http'].received_headers(self.request))
     def handle_headers(self):
         self.received_headers = True
         status = self['http'].status(self.request)
         headers = self['http'].headers(self.request)
-        return ActionResult(production=(status, headers))
+        return (status, headers)
 
+    @stateguard(lambda self: self.received_headers and self['http'].received_body(self.request))
     @condition(action_output=['data'])
-    @guard(lambda self: self.received_headers and self['http'].received_body(self.request))
     def handle_body(self):
         body = self['http'].body(self.request)
         self.reset_request()
-        return ActionResult(production=(body,))
+        return (body,)
 
+    @stateguard(lambda self: self.received_headers and self['http'].received_empty_body(self.request))
     @condition()
-    @guard(lambda self: self.received_headers and self['http'].received_empty_body(self.request))
     def handle_empty_body(self):
         self.reset_request()
-        return ActionResult()
+        
 
     action_priority = (handle_body, handle_empty_body, handle_headers, new_request)
     requires = ['calvinsys.network.httpclienthandler']

@@ -74,7 +74,11 @@ class CalvinTransportBase(CalvinCBClass):
         self._callback_execute('connected')
             Called when the client is connected
         self._callback_execute('disconnected', reason)
-            Called when the clinent disconnects
+            Called when the client disconnects
+                reason the a string desribing the reason for disconnecting
+                    (normal, error, ..)
+        self._callback_execute('connection_failed', reason)
+            Called when the connection fails
                 reason the a string desribing the reason for disconnecting
                     (normal, error, ..)
         self._callback_execute('data', data)
@@ -91,7 +95,8 @@ class CalvinTransportBase(CalvinCBClass):
             proto       Can be sent in here if its a connecting client from a server instance
 
         """
-        super(CalvinTransportBase, self).__init__(callbacks, callback_valid_names=['connected', 'disconnected', 'data'])
+        self._rtt = None
+        super(CalvinTransportBase, self).__init__(callbacks, callback_valid_names=['connected', 'disconnected', 'connection_failed', 'data'])
 
     def is_connected(self):
         """
@@ -117,3 +122,6 @@ class CalvinTransportBase(CalvinCBClass):
             Called when the client should connect
         """
         raise NotImplementedError()
+
+    def get_rtt(self):
+        return self._rtt

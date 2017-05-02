@@ -16,7 +16,7 @@
 
 # encoding: utf-8
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 from calvin.runtime.north.calvin_token import EOSToken, ExceptionToken
 
 class Dict(Actor):
@@ -46,38 +46,38 @@ class Dict(Actor):
         self._dict = ExceptionToken()
         self.done = True
 
-    def exception_handler(self, action, args, context):
-        if self.n or not ('key' in context['exceptions'] and 'value' in context['exceptions']):
+    def exception_handler(self, action, args):
+        if self.n or not (isinstance(args[0], EOSToken) and isinstance(args[1], EOSToken)):
             self._bail()
         self.done = True
-        return ActionResult()
 
+
+    @stateguard(lambda self: not self.n and not self.done)
     @condition(['key', 'value'], [])
-    @guard(lambda self, key, value: not self.n and not self.done)
     def add_entry_EOS(self, key, value):
         if isinstance(key, basestring):
             self._dict[key] = value
         else:
             self._bail()
-        return ActionResult()
 
+
+    @stateguard(lambda self: self.n and not self.done)
     @condition(['key', 'value'], [])
-    @guard(lambda self, key, value: self.n and not self.done)
     def add_entry(self, key, value):
         if isinstance(key, basestring):
             self._dict[key]=value
             self.done = bool(len(self._dict) == self.n)
         else:
             self._bail()
-        return ActionResult()
 
+
+    @stateguard(lambda self: self.done)
     @condition([], ['dict'])
-    @guard(lambda self: self.done)
     def produce_dict(self):
         res = self._dict
         self.done = False
         self._dict = {}
-        return ActionResult(production=(res, ))
+        return (res, )
 
     action_priority = (produce_dict, add_entry, add_entry_EOS)
 

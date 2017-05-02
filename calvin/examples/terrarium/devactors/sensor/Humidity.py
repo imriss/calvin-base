@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, condition
+from calvin.actor.actor import Actor, condition
 
 
 class Humidity(Actor):
@@ -44,7 +44,7 @@ class Humidity(Actor):
         result['value'] = int(result['value'])
         result['unit'] = "%"
         
-        return ActionResult(production=(result, ))
+        return (result, )
 
     action_priority = (get_humidity, )
     requires = ["calvinsys.sensors.environmental"]

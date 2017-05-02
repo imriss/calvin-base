@@ -36,21 +36,28 @@ class Authentication(object):
     """Authentication helper functions"""
 
     def __init__(self, node):
+        _log.debug("Authentication::__init__")
         self.node = node
         try:
             if _sec_conf['authentication']['procedure'] == "local":
-                self.adp = AuthenticationDecisionPoint(self.node, _sec_conf['authentication'])
+                _log.debug("Authentication::__init__   local authentication procedure configured")
                 self.arp = FileAuthenticationRetrievalPoint(_sec_conf['authentication']['identity_provider_path'])
+                self.adp = AuthenticationDecisionPoint(self.node, _sec_conf['authentication'])
                 self.auth_server_id = self.node.id
             else:
+                _log.debug("Authentication::__init__   external authentication procedure configured")
                 self.auth_server_id = _sec_conf['authentication']['server_uuid']
         except Exception as e:
             _log.info("Missing or incomplete security config")
             self.auth_server_id = None
 
-    def decode_request(self, data):
+    def decode_request(self, data, callback):
         """Decode the JSON Web Token in the data."""
-        return decode_jwt(data["jwt"], data["cert_name"], self.node.node_name, self.node.id)
+        _log.debug("decode_request, \n\tdata={}\n\tcallback={}".format(data, callback))
+        return decode_jwt(data["jwt"],
+                          data["cert_name"],
+                          self.node,
+                          callback=callback)
 
     def encode_response(self, request, response, audience=None):
         """Encode the response to the request as a JSON Web Token."""
@@ -64,6 +71,6 @@ class Authentication(object):
         if "sub" in request:
             jwt_payload["sub"] = request["sub"]
         # Create a JSON Web Token signed using the authentication server's private key.
-        return encode_jwt(jwt_payload, self.node.node_name)
+        return encode_jwt(jwt_payload, self.node)
 
 

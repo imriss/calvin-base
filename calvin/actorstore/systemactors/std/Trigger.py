@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from calvin.actor.actor import Actor, ActionResult, manage, condition, guard
+from calvin.actor.actor import Actor, manage, condition, stateguard
 
 
 class Trigger(Actor):
@@ -48,17 +48,17 @@ class Trigger(Actor):
         if self.started:
             self.start()
 
+    @stateguard(lambda self: not self.started)
     @condition([], ['data'])
-    @guard(lambda self: not self.started)
     def start_timer(self):
         self.start()
-        return ActionResult(production=(self.data, ))
+        return (self.data, )
 
+    @stateguard(lambda self: self.timer and self.timer.triggered)
     @condition([], ['data'])
-    @guard(lambda self: self.timer and self.timer.triggered)
     def trigger(self):
         self.timer.ack()
-        return ActionResult(production=(self.data, ))
+        return (self.data, )
 
     action_priority = (start_timer, trigger)
     requires = ['calvinsys.events.timer']
