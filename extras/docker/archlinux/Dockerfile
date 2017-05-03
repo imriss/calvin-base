@@ -21,7 +21,7 @@ RUN add-aur docker
 
 RUN su docker -c 'pacaur -S --needed --noprogressbar --noedit --noconfirm curl'
 
-RUN cd /home/docker/sandground \
+RUN cd / \
   && git clone --depth=50 --branch=master https://github.com/EricssonResearch/calvin-base calvin-base \
   && cd /calvin-base \
   && pip install --upgrade -r requirements.txt -r test-requirements.txt -e . 
