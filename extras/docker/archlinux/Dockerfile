@@ -9,7 +9,7 @@ RUN  pacman -Syyu --noconfirm \
   && pacman -S findutils nano vi --needed --noconfirm \
   && pacman-db-upgrade \
   && export editor=nano \
-  && pacman -S --needed --noconfirm systemd python python-yaml wget 
+  && pacman -S --needed --noconfirm systemd python python-yaml wget pip 
 
 # DDADD https://raw.githubusercontent.com/imriss/scylla/master/aur.sh /usr/sbin/aur.sh
 # DDADD https://raw.githubusercontent.com/imriss/scylla/master/add-aur.sh /usr/sbin/add-aur
